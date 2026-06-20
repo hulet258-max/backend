@@ -21,6 +21,12 @@ const screenshotRecRoutes = require('./api/screenshotrec');
 const joinRoomRoutes = require('./routes/joinRoom');
 const gameplayRoutes = require('./routes/gameplay');
 const botGamerRoutes = require('./routes/botgamer');
+const {
+  cleanupManagedBotRoomForUser,
+  deleteManagedBotRoom,
+  ensureManagedBotRoomForUser,
+  reconcileConnectedUsers,
+} = botGamerRoutes;
 const adminRoutes = require('./routes/admin');
 const settingsRoutes = require('./routes/settings');
 const { emitBalanceUpdates } = require('./services/balanceEvents');
@@ -29,6 +35,8 @@ const app = express();
 const PORT = process.env.PORT || 8000;
 const ROOM_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
 const ROOM_CLEANUP_INTERVAL_MS = 60 * 1000;
+const MANAGED_BOT_WAIT_TIMEOUT_MS = 10 * 60 * 1000;
+const BOT_ROOM_RECONCILE_INTERVAL_MS = 15 * 1000;
 
 async function deleteIdleRooms(io) {
   if (!redis.isOpen) return;
@@ -38,6 +46,7 @@ async function deleteIdleRooms(io) {
     const now = Date.now();
 
     for (const key of keys) {
+      if (key.endsWith(':bot-lock')) continue;
       const roomId = key.replace('room:', '');
       const roomStateText = await redis.get(key);
       if (!roomStateText) continue;
@@ -58,11 +67,19 @@ async function deleteIdleRooms(io) {
       }
 
       const lastActivityTime = lastActivityAt ? new Date(lastActivityAt).getTime() : now;
+      if (
+        roomState.managedBotRoom &&
+        roomState.status === 'waiting' &&
+        now - lastActivityTime >= MANAGED_BOT_WAIT_TIMEOUT_MS
+      ) {
+        await deleteManagedBotRoom(io, roomId, roomState.generatedFor);
+        continue;
+      }
       if (!Number.isFinite(lastActivityTime) || now - lastActivityTime < ROOM_IDLE_TIMEOUT_MS) {
         continue;
       }
 
-      if (roomState.practice || roomState.botGame) {
+      if (roomState.practice) {
         await deleteRoom(roomId, 'practice-idle-cleanup');
         await redis.del(key);
         await redis.del('rooms:list');
@@ -160,6 +177,7 @@ app.set('io', io);
         try {
           // Store socketId in Redis using telegramId as the key
           await redis.set(`user:${telegramId}:socket`, socket.id);
+          await ensureManagedBotRoomForUser(io, telegramId);
           console.log(`✅ Saved to Redis: User ${telegramId} -> Socket ${socket.id}`);
 
           // Fetch and display current Redis data in the console
@@ -184,7 +202,11 @@ app.set('io', io);
           for (const key of keys) {
             const socketVal = await redis.get(key);
             if (socketVal === socket.id) {
+              const disconnectedUserId = key.match(/^user:(.+):socket$/)?.[1];
               await redis.del(key);
+              if (disconnectedUserId) {
+                await cleanupManagedBotRoomForUser(io, disconnectedUserId);
+              }
               console.log(`🗑️ Removed ${key} from Redis on disconnect.`);
             }
           }
@@ -203,6 +225,7 @@ app.set('io', io);
 
     deleteIdleRooms(io);
     setInterval(() => deleteIdleRooms(io), ROOM_CLEANUP_INTERVAL_MS);
+    setInterval(() => reconcileConnectedUsers(io), BOT_ROOM_RECONCILE_INTERVAL_MS);
 
     // Start server
     server.listen(PORT, () => {

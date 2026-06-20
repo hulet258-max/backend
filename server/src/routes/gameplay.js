@@ -13,6 +13,10 @@ const {
 const { createInitialGameState } = require("../services/gameService");
 const { emitBalanceUpdates } = require("../services/balanceEvents");
 const {
+    biasBotInitialHand,
+    fundManagedBotForRound,
+    isBotGameState,
+    reconcileConnectedUsers,
     scheduleBotTurn,
     isPracticeState,
 } = require("./botgamer");
@@ -65,11 +69,7 @@ const canCompletePatternWithJokers = (counts = [], jokerCount = 0) => {
             if (search(nextCounts, remainingJokers - 1)) return true;
         }
 
-        if (currentCounts.length < 4) {
-            return search([...currentCounts, 1], remainingJokers - 1);
-        }
-
-        return false;
+    return false;
     };
 
     return search(counts.slice(), jokerCount);
@@ -78,10 +78,8 @@ const canCompletePatternWithJokers = (counts = [], jokerCount = 0) => {
 const analyzeWinningHand = (cards = []) => {
     const jokerCount = cards.filter(isJoker).length;
     const naturalCounts = getRankCountPattern(cards, false);
-    const naturalPattern = matchesWinningPattern(getRankCountPattern(cards, true));
-    const jokerBonus = jokerCount > 0 &&
-        naturalCounts.includes(4) &&
-        naturalCounts.filter((count) => count === 3).length >= 2;
+    const naturalPattern = matchesWinningPattern(naturalCounts);
+    const jokerBonus = false;
 
     return {
         isWinning: naturalPattern || canCompletePatternWithJokers(naturalCounts, jokerCount),
@@ -156,6 +154,8 @@ const resetRoomToWaiting = (redisData) => {
     redisData.inactiveReason = null;
     redisData.inactiveMessage = null;
     redisData.leaveVote = null;
+    redisData.botActionCounts = { picks: 0, lays: 0 };
+    redisData.lastPick = null;
 };
 
 // Helper to save room state to Redis and emit update to clients
@@ -234,9 +234,15 @@ router.post('/gameplay/take-card', async (req, res) => {
 
         const card = redisData.deck.pop(); // Take top card
         redisData.playerCards[userId].push(card); // Add to player's hand
+        redisData.lastPick = {
+            playerId: String(userId),
+            source: "deck",
+            at: new Date().toISOString(),
+            nonce: `${Date.now()}-${Math.random()}`,
+        };
 
         await saveAndEmitState(req, roomId, redisData, userId, socketId);
-        res.status(200).json({ success: true, message: 'Card taken from deck', redisData });
+        res.status(200).json({ success: true, message: 'Card taken from deck', pickedCard: card, source: "deck", redisData });
 
     } catch (error) {
         console.error('Take card error:', error);
@@ -280,9 +286,15 @@ router.post('/gameplay/pick-card', async (req, res) => {
 
         const card = redisData.laidCards.pop(); // Take top card from laid pile
         redisData.playerCards[userId].push(card);
+        redisData.lastPick = {
+            playerId: String(userId),
+            source: "laid",
+            at: new Date().toISOString(),
+            nonce: `${Date.now()}-${Math.random()}`,
+        };
 
         await saveAndEmitState(req, roomId, redisData, userId, socketId);
-        res.status(200).json({ success: true, message: 'Picked from laid cards', redisData });
+        res.status(200).json({ success: true, message: 'Picked from laid cards', pickedCard: card, source: "laid", redisData });
 
     } catch (error) {
         console.error('Pick card error:', error);
@@ -337,7 +349,7 @@ router.post('/gameplay/lay-card', async (req, res) => {
         redisData.turn = playerIds[nextPlayerIndex];
 
         await saveAndEmitState(req, roomId, redisData, userId, socketId);
-        if (isPracticeState(redisData)) {
+        if (isBotGameState(redisData)) {
             scheduleBotTurn(req, roomId);
         }
         res.status(200).json({ success: true, message: 'Card laid and turn passed', redisData });
@@ -386,6 +398,7 @@ router.post('/gameplay/declare-win', async (req, res) => {
         }
         await redis.del("rooms:list");
         await saveAndEmitState(req, roomId, redisData, userId, socketId);
+        await reconcileConnectedUsers(req.app.get('io'));
         return res.status(200).json({
             success: true,
             message: "Winner declared. Game ended.",
@@ -426,18 +439,32 @@ router.post('/gameplay/play-again', async (req, res) => {
                 commissionAmount: 0,
             };
         } else {
+            await fundManagedBotForRound(redisData, roomData.entryFee);
             try {
                 redisData.roomStats = await escrowRoomEntryFees(roomId, playerIds, roomData.entryFee);
             } catch (error) {
-                const message = String(error.message || "").startsWith("INSUFFICIENT_BALANCE")
+                const rawMessage = String(error.message || "");
+                const insufficientPlayerId = rawMessage.startsWith("INSUFFICIENT_BALANCE:")
+                    ? rawMessage.split(":").slice(1).join(":")
+                    : null;
+                const message = insufficientPlayerId
                     ? "A player does not have enough balance to continue this room."
                     : error.message || "Could not collect entry fees for the next game.";
-                return res.status(400).json({ error: message });
+                return res.status(400).json({
+                    error: message,
+                    code: insufficientPlayerId ? "INSUFFICIENT_BALANCE" : "ROOM_ESCROW_FAILED",
+                    insufficientPlayerId,
+                    depositRequired: Boolean(insufficientPlayerId && String(insufficientPlayerId) === String(userId)),
+                    entryFee: roomData.entryFee,
+                });
             }
             await emitBalanceUpdates(req.app.get('io'), playerIds);
         }
 
         const nextGameState = createInitialGameState(playerIds);
+        if (redisData.managedBotRoom) {
+            biasBotInitialHand(nextGameState, redisData.botProfile?.id || playerIds.find((id) => String(id).startsWith("botgamer:")));
+        }
         redisData.turn = nextGameState.turn;
         redisData.playerCards = nextGameState.playerCards;
         redisData.deck = nextGameState.deck;
@@ -448,10 +475,12 @@ router.post('/gameplay/play-again', async (req, res) => {
         redisData.paused = false;
         redisData.inactiveReason = null;
         redisData.leaveVote = null;
+        redisData.botActionCounts = { picks: 0, lays: 0 };
+        redisData.lastPick = null;
 
         await updateRoomStatus(roomId, "playing");
         await saveAndEmitState(req, roomId, redisData, userId, socketId);
-        if (isPracticeState(redisData)) {
+        if (isBotGameState(redisData)) {
             scheduleBotTurn(req, roomId);
         }
         return res.status(200).json({
@@ -535,6 +564,9 @@ router.post('/gameplay/leave-game', async (req, res) => {
         if (redisData.gameEnded || redisData.status === "ended") {
             redisData.roomStats = await finalizeRoomLedger(roomId, "game-ended-player-left");
             await emitBalanceUpdates(req.app.get('io'), getMoneyEventUserIds(redisData.roomStats));
+            resetRoomToWaiting(redisData);
+            await updateRoomStatus(roomId, "waiting");
+            await redis.del("rooms:list");
         }
 
         if (!redisData.gameEnded && redisData.status === "playing") {

@@ -10,7 +10,12 @@ const {
   updateRoomStatus,
 } = require("../db/store");
 const { emitBalanceUpdates } = require("../services/balanceEvents");
-const { scheduleBotTurn, isPracticeState } = require("./botgamer");
+const {
+  biasBotInitialHand,
+  isBotGameState,
+  reconcileConnectedUsers,
+  scheduleBotTurn,
+} = require("./botgamer");
 
 // ✨ Import the game logic service
 const { createInitialGameState } = require("../services/gameService"); 
@@ -77,7 +82,7 @@ router.post("/join-room", async (req, res) => {
                 redisData.inactiveMessage = null;
                 if (roomData.players.length === roomData.maxPlayers) {
                   try {
-                    await escrowRoomEntryFees(roomId, roomData.players, roomData.entryFee);
+                    redisData.roomStats = await escrowRoomEntryFees(roomId, roomData.players, roomData.entryFee);
                   } catch (error) {
                     const message = String(error.message || "").startsWith("INSUFFICIENT_BALANCE")
                       ? "A player does not have enough balance to start this room."
@@ -87,15 +92,20 @@ router.post("/join-room", async (req, res) => {
                   await emitBalanceUpdates(req.app.get("io"), roomData.players);
                   roomData = await updateRoomStatus(roomId, "playing");
                   const initialGameState = createInitialGameState(roomData.players);
+                  if (redisData.managedBotRoom) {
+                    biasBotInitialHand(initialGameState, redisData.botProfile?.id || roomData.players[0]);
+                  }
                   redisData.turn = initialGameState.turn;
                   redisData.playerCards = initialGameState.playerCards;
                   redisData.deck = initialGameState.deck;
                   redisData.laidCards = initialGameState.laidCards;
                   redisData.status = "playing";
+                  redisData.botActionCounts = { picks: 0, lays: 0 };
+                  redisData.lastPick = null;
                 }
               }
               await redis.set(`room:${roomId}`, JSON.stringify(redisData));
-              if (isPracticeState(redisData)) {
+              if (isBotGameState(redisData)) {
                 scheduleBotTurn(req, roomId);
               }
               const io = req.app.get("io");
@@ -153,7 +163,7 @@ router.post("/join-room", async (req, res) => {
       if (updatedRoom.players.length === updatedRoom.maxPlayers) {
         console.log(`🎲 Room ${roomId} is full! Initializing game...`);
         try {
-          await escrowRoomEntryFees(roomId, updatedRoom.players, updatedRoom.entryFee);
+          redisData.roomStats = await escrowRoomEntryFees(roomId, updatedRoom.players, updatedRoom.entryFee);
         } catch (error) {
           await removePlayerFromRoom(roomId, userId);
           redisData.players = redisData.players.filter((p) => String(p.telegramId) !== String(userId));
@@ -171,6 +181,9 @@ router.post("/join-room", async (req, res) => {
         
         // Generate the game state (passing the simple array of IDs from Postgres)
         const initialGameState = createInitialGameState(updatedRoom.players);
+        if (redisData.managedBotRoom) {
+          biasBotInitialHand(initialGameState, redisData.botProfile?.id || updatedRoom.players[0]);
+        }
         
         // Merge the new game fields into the existing Redis data object
         redisData.turn = initialGameState.turn;
@@ -179,9 +192,15 @@ router.post("/join-room", async (req, res) => {
         redisData.laidCards = initialGameState.laidCards;
         redisData.status = "playing"; // Update status
         redisData.lastActivityAt = new Date().toISOString();
+        redisData.botActionCounts = { picks: 0, lays: 0 };
+        redisData.lastPick = null;
       }
 
       await redis.set(key, JSON.stringify(redisData));
+
+      if (isBotGameState(redisData) && redisData.status === "playing") {
+        scheduleBotTurn(req, roomId);
+      }
 
       // ✨ NEW: Emit a 'room_update' event to all players in the room.
       // This notifies existing players of the new joiner, and if the game started,
@@ -196,6 +215,9 @@ router.post("/join-room", async (req, res) => {
         };
         if (updatedRoom.playerCount >= updatedRoom.maxPlayers) {
           io.emit("room_unavailable", { roomId });
+          reconcileConnectedUsers(io).catch((error) => {
+            console.error("Could not reconcile managed bot rooms after join:", error);
+          });
         }
         console.log(`📢 Emitting 'room_update' to players in room ${roomId}`);
         redisData.players.forEach((p) => {

@@ -92,6 +92,7 @@ function calculateCommissionAmount(totalPot, entryFee, gamesPlayed = 0) {
 
 function normalizeRoomStats(stats = {}) {
   const entryFee = roundMoney(stats.entryFee || 0);
+  const botResults = stats.botResults || {};
   return {
     gamesPlayed: Number(stats.gamesPlayed || 0),
     winnerCounts: stats.winnerCounts || {},
@@ -114,6 +115,17 @@ function normalizeRoomStats(stats = {}) {
     topWinnerIds: (stats.topWinnerIds || []).map(String),
     finalizedReason: stats.finalizedReason || null,
     finalizedAt: stats.finalizedAt || null,
+    practice: Boolean(stats.practice),
+    botGame: Boolean(stats.botGame),
+    managedBotRoom: Boolean(stats.managedBotRoom),
+    generatedFor: stats.generatedFor ? String(stats.generatedFor) : null,
+    botProfile: stats.botProfile || null,
+    targetBotWinRate: Number(stats.targetBotWinRate || 0),
+    botResults: {
+      gamesPlayed: Number(botResults.gamesPlayed || 0),
+      wins: Number(botResults.wins || 0),
+      losses: Number(botResults.losses || 0),
+    },
   };
 }
 
@@ -125,6 +137,43 @@ function roomHasCompletedGame(stats = {}) {
 async function getUser(telegramId) {
   const result = await query("SELECT * FROM users WHERE telegram_id = $1", [String(telegramId)]);
   return mapUser(result.rows[0]);
+}
+
+async function createSyntheticBot({ telegramId, displayName, balance }) {
+  const result = await query(
+    `INSERT INTO users (
+      telegram_id, username, display_name, first_name, balance, created_at, last_seen
+    )
+    VALUES ($1, '', $2, $2, $3, NOW(), NOW())
+    ON CONFLICT (telegram_id) DO UPDATE SET
+      display_name = EXCLUDED.display_name,
+      first_name = EXCLUDED.first_name,
+      balance = EXCLUDED.balance,
+      last_seen = NOW()
+    RETURNING *`,
+    [String(telegramId), String(displayName), roundMoney(balance)]
+  );
+  return mapUser(result.rows[0]);
+}
+
+async function ensureSyntheticBotBalance(botId, minimumBalance, fundedBalance) {
+  const targetBalance = Math.max(roundMoney(minimumBalance), roundMoney(fundedBalance));
+  const result = await query(
+    `UPDATE users
+    SET balance = CASE WHEN balance < $2 THEN $2 ELSE balance END,
+      last_seen = NOW()
+    WHERE telegram_id = $1
+    RETURNING *`,
+    [String(botId), targetBalance]
+  );
+  return mapUser(result.rows[0]);
+}
+
+async function deleteSyntheticBot(botId) {
+  await query(
+    "DELETE FROM users WHERE telegram_id = $1 AND telegram_id LIKE 'botgamer:managed:%'",
+    [String(botId)]
+  );
 }
 
 async function ensureUser(telegramId) {
@@ -578,6 +627,35 @@ async function listPublicRooms() {
   return result.rows.map(mapRoom);
 }
 
+async function getAffordableJoinableHumanRoom(balance) {
+  const result = await query(
+    `SELECT * FROM rooms
+    WHERE visibility = 'public'
+      AND status = 'waiting'
+      AND player_count < max_players
+      AND entry_fee <= $1
+      AND COALESCE(room_stats->>'botGame', 'false') <> 'true'
+    ORDER BY created_at ASC
+    LIMIT 1`,
+    [roundMoney(balance)]
+  );
+  return mapRoom(result.rows[0]);
+}
+
+async function getWaitingManagedBotRoomForUser(userId) {
+  const result = await query(
+    `SELECT * FROM rooms
+    WHERE status = 'waiting'
+      AND player_count = 1
+      AND COALESCE(room_stats->>'managedBotRoom', 'false') = 'true'
+      AND room_stats->>'generatedFor' = $1
+    ORDER BY created_at DESC
+    LIMIT 1`,
+    [String(userId)]
+  );
+  return mapRoom(result.rows[0]);
+}
+
 async function listLobbyRooms(userId) {
   if (!userId) return listPublicRooms();
 
@@ -712,6 +790,19 @@ async function escrowRoomEntryFees(roomId, playerIds, entryFee) {
     });
 
     const roundPot = roundMoney(fee * normalizedPlayerIds.length);
+    let botProfile = roomStats.botProfile;
+    if (roomStats.botGame && botProfile?.id) {
+      const botResult = await client.query(
+        "SELECT balance FROM users WHERE telegram_id = $1",
+        [String(botProfile.id)]
+      );
+      if (botResult.rows[0]) {
+        botProfile = {
+          ...botProfile,
+          balance: parseNumber(botResult.rows[0].balance),
+        };
+      }
+    }
     const nextStats = normalizeRoomStats({
       ...roomStats,
       feeEscrowed: true,
@@ -724,6 +815,7 @@ async function escrowRoomEntryFees(roomId, playerIds, entryFee) {
       commissionRate: getCommissionRate(fee, roomStats.gamesPlayed),
       roundsEscrowed: targetRound,
       playerFeesPaid,
+      botProfile,
     });
 
     await client.query("UPDATE rooms SET room_stats = $2 WHERE id = $1", [
@@ -778,6 +870,26 @@ async function recordRoomGameResult(roomId, winnerId, playerIds, options = {}) {
       ...(roomStats.payouts || {}),
       [normalizedWinnerId]: roundMoney(Number(roomStats.payouts?.[normalizedWinnerId] || 0) + winnerPayout),
     };
+    if (roomStats.botGame) {
+      const botWon = normalizedWinnerId.startsWith("botgamer:");
+      roomStats.botResults = {
+        gamesPlayed: Number(roomStats.botResults?.gamesPlayed || 0) + 1,
+        wins: Number(roomStats.botResults?.wins || 0) + (botWon ? 1 : 0),
+        losses: Number(roomStats.botResults?.losses || 0) + (botWon ? 0 : 1),
+      };
+      if (roomStats.botProfile?.id) {
+        const botResult = await client.query(
+          "SELECT balance FROM users WHERE telegram_id = $1",
+          [String(roomStats.botProfile.id)]
+        );
+        if (botResult.rows[0]) {
+          roomStats.botProfile = {
+            ...roomStats.botProfile,
+            balance: parseNumber(botResult.rows[0].balance),
+          };
+        }
+      }
+    }
     roomStats.topWinnerIds = Object.entries(roomStats.winnerWeights)
       .sort(([, a], [, b]) => Number(b || 0) - Number(a || 0))
       .map(([playerId]) => playerId);
@@ -1207,6 +1319,9 @@ module.exports = {
   ensureAppSchema,
   getUser,
   ensureUser,
+  createSyntheticBot,
+  ensureSyntheticBotBalance,
+  deleteSyntheticBot,
   upsertUser,
   updateUserDisplayName,
   getPublicUsers,
@@ -1218,6 +1333,8 @@ module.exports = {
   getCreatorActiveRoom,
   getUserActiveRoom,
   listPublicRooms,
+  getAffordableJoinableHumanRoom,
+  getWaitingManagedBotRoomForUser,
   listLobbyRooms,
   addPlayerToRoom,
   removePlayerFromRoom,
