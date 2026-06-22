@@ -524,6 +524,21 @@ router.post('/gameplay/leave-game', async (req, res) => {
         const isCreator = String(roomData.creatorId) === String(userId);
         const isPlaying = redisData.status === "playing";
 
+        // Leaving the waiting-room screen must not delete the creator's room.
+        // Keep the creator in the room so it remains visible in the lobby and
+        // can still accept players. The lobby provides an explicit delete action.
+        if (isCreator && redisData.status === "waiting" && !forceLeave) {
+            if (socketId && redisData.players?.[leavingIndex]) {
+                redisData.players[leavingIndex].socketId = socketId;
+            }
+            await saveAndEmitState(req, roomId, redisData, userId, socketId);
+            return res.status(200).json({
+                success: true,
+                message: "Returned to lobby. Room was kept open.",
+                redisData
+            });
+        }
+
         if (isPlaying && !forceLeave) {
             if (socketId && redisData.players?.[leavingIndex]) {
                 redisData.players[leavingIndex].socketId = socketId;

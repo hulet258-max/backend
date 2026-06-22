@@ -1,8 +1,19 @@
 // server/src/bot/bot.js
 
 const { Telegraf } = require('telegraf');
-const { WELCOME_GIFT_COINS } = require("../config/economy");
-const { getRoom, getUser, upsertUser } = require("../db/store");
+const { ensureUser, getRoom } = require("../db/store");
+
+const GAME_INTRO = [
+  "Welcome to Karta!",
+  "",
+  "How to play:",
+  "1. Join a room or practice against the bot.",
+  "2. On your turn, pick one card from the deck or the laid pile, then lay one card.",
+  "3. Arrange your 11 cards into matching-rank groups of 4-3-3-1.",
+  "4. When your hand is ready, tap Win to declare it.",
+  "",
+  "Public and private rooms use coins; practice games are free.",
+].join("\n");
 
 function buildWebAppUrl(referralCode = "") {
   const webAppUrl = process.env.WEB_APP_URL;
@@ -22,14 +33,23 @@ function buildRoomWebAppUrl(roomId) {
   try {
     const url = new URL(webAppUrl);
     const basePath = url.pathname.replace(/\/$/, "");
-    url.pathname = `${basePath}/second`;
+    url.pathname = `${basePath}/game/${encodeURIComponent(String(roomId))}`;
     url.search = "";
-    url.searchParams.set("roomId", String(roomId));
     return url.toString();
   } catch (error) {
     const cleanBase = String(webAppUrl).replace(/\/$/, "");
-    return `${cleanBase}/second?roomId=${encodeURIComponent(String(roomId))}`;
+    return `${cleanBase}/game/${encodeURIComponent(String(roomId))}`;
   }
+}
+
+function buildRoomLaunchUrl(roomId, botUsername = "") {
+  const cleanUsername = String(botUsername || "").replace(/^@/, "").trim();
+  if (cleanUsername && roomId) {
+    const startParam = `room_${roomId}`;
+    return `https://t.me/${cleanUsername}?startapp=${encodeURIComponent(startParam)}`;
+  }
+
+  return buildRoomWebAppUrl(roomId);
 }
 
 function extractRoomIdFromInlineQuery(query = "") {
@@ -48,38 +68,36 @@ function extractRoomIdFromInlineQuery(query = "") {
   }
 }
 
-function buildRoomInlineResult(room, roomUrl, useWebAppButton = true) {
-  const button = useWebAppButton
-    ? { text: "Join this", web_app: { url: roomUrl } }
-    : { text: "Join this", url: roomUrl };
+function buildRoomInlineResult(room, roomUrl) {
+  const roomName = room.name || "Private room";
+  const playerCount = Number(room.playerCount || 0);
+  const maxPlayers = Number(room.maxPlayers || 0);
+  const entryFee = Number(room.entryFee || 0);
 
   return {
     type: "article",
     id: `room-${room.id}`,
-    title: "Join this",
-    description: `${room.name} - ${room.playerCount}/${room.maxPlayers} players`,
+    title: "Share private Karta game",
+    description: `${roomName} | ${playerCount}/${maxPlayers} players | ${entryFee} coins`,
     input_message_content: {
-      message_text: `Karta private room: ${room.name}`,
+      message_text: [
+        "Private Karta game",
+        `Room: ${roomName}`,
+        `Players: ${playerCount}/${maxPlayers}`,
+        `Entry: ${entryFee} coins`,
+        "",
+        "Tap Play now to join the game.",
+      ].join("\n"),
     },
     reply_markup: {
-      inline_keyboard: [[button]],
+      inline_keyboard: [[{ text: "Play now", url: roomUrl }]],
     },
   };
 }
 
 async function answerRoomInlineQuery(ctx, room, roomUrl) {
   const options = { cache_time: 0, is_personal: true };
-
-  try {
-    await ctx.answerInlineQuery([buildRoomInlineResult(room, roomUrl, true)], options);
-  } catch (error) {
-    const message = String(error?.description || error?.message || "");
-    if (!/web_app|button_type|BUTTON_TYPE/i.test(message)) {
-      throw error;
-    }
-
-    await ctx.answerInlineQuery([buildRoomInlineResult(room, roomUrl, false)], options);
-  }
+  await ctx.answerInlineQuery([buildRoomInlineResult(room, roomUrl)], options);
 }
 
 /**
@@ -95,103 +113,24 @@ function createBot() {
   // /start command
   bot.start(async (ctx) => {
     const webAppUrl = buildWebAppUrl(ctx.startPayload);
-    await ctx.reply(
-      'Welcome 👋\nPlease share your phone number to continue.',
-      {
-        reply_markup: {
-          keyboard: [
-            [{ text: '📱 Share Phone Number', request_contact: true }]
-          ],
-          resize_keyboard: true,
-          one_time_keyboard: true
-        }
-      }
-    );
+    try {
+      await ensureUser(ctx.from.id);
+    } catch (err) {
+      console.error('Bot start user sync error:', err);
+    }
+
+    await ctx.reply(GAME_INTRO, {
+      reply_markup: { remove_keyboard: true },
+    });
 
     if (webAppUrl) {
-      await ctx.reply(' Open the Web App', {
+      await ctx.reply('Ready to play?', {
         reply_markup: {
           inline_keyboard: [
-            [{ text: ' Open Web App', web_app: { url: webAppUrl } }]
+            [{ text: 'Play now', web_app: { url: webAppUrl } }]
           ]
         }
       });
-    }
-  });
-
-  // contact handler
-  bot.on('contact', async (ctx) => {
-    try {
-
-      const contact = ctx.message.contact;
-
-      // verify ownership
-      if (contact.user_id !== ctx.from.id) {
-        return ctx.reply(' Please share your own number.');
-      }
-
-      const existingUser = await getUser(ctx.from.id);
-
-      let userData;
-
-      if (!existingUser) {
-
-        // FIRST TIME USER
-        userData = {
-          telegramId: ctx.from.id,
-          phone: contact.phone_number,
-          username: ctx.from.username || '',
-          firstName: ctx.from.first_name || '',
-          lastName: ctx.from.last_name || '',
-
-          // NEW GAME FIELDS
-          balance: WELCOME_GIFT_COINS,
-          roomIn: null,
-          depositSum: 0,
-
-          createdAt: new Date(),
-          lastSeen: new Date()
-        };
-
-      } else {
-
-        // EXISTING USER
-        userData = {
-          telegramId: ctx.from.id,
-          phone: contact.phone_number,
-          username: ctx.from.username || '',
-          firstName: ctx.from.first_name || '',
-          lastName: ctx.from.last_name || '',
-          lastSeen: new Date()
-        };
-
-      }
-
-      await upsertUser(userData);
-
-
-      const webAppUrl = buildWebAppUrl();
-
-      await ctx.reply(' Registration complete.', {
-        reply_markup: { remove_keyboard: true }
-      });
-
-      if (webAppUrl) {
-        await ctx.reply(' Open the Web App', {
-          reply_markup: {
-            inline_keyboard: [
-              [{ text: ' Open Web App', web_app: { url: webAppUrl } }]
-            ]
-          }
-        });
-      }
-
-    } catch (err) {
-
-      console.error('Bot contact error:', err);
-
-      ctx.reply(' Failed to save your data.');
-
     }
   });
 
@@ -204,7 +143,7 @@ function createBot() {
 
     try {
       const room = await getRoom(roomId);
-      const roomUrl = buildRoomWebAppUrl(room?.id);
+      const roomUrl = buildRoomLaunchUrl(room?.id, ctx.botInfo?.username);
 
       if (!room || !roomUrl || room.visibility !== "private" || room.status !== "waiting") {
         return ctx.answerInlineQuery([], { cache_time: 0, is_personal: true });
