@@ -1,7 +1,7 @@
 // server/src/bot/bot.js
 
 const { Telegraf } = require('telegraf');
-const { ensureUser, getRoom } = require("../db/store");
+const { ensureUser, getReferralLink, getRoom } = require("../db/store");
 
 const GAME_INTRO = [
   "Welcome to Karta!",
@@ -52,6 +52,28 @@ function buildRoomLaunchUrl(roomId, botUsername = "") {
   return buildRoomWebAppUrl(roomId);
 }
 
+function buildReferralLaunchUrl(code, botUsername = "") {
+  const cleanUsername = String(botUsername || "").replace(/^@/, "").trim();
+  const cleanCode = String(code || "").replace(/^ref_/, "").trim();
+  if (cleanUsername && cleanCode) {
+    return `https://t.me/${cleanUsername}?startapp=${encodeURIComponent(`ref_${cleanCode}`)}`;
+  }
+
+  return buildWebAppUrl(cleanCode);
+}
+
+function buildReferralPhotoUrl() {
+  const configuredUrl = String(process.env.REFERRAL_SHARE_PHOTO_URL || "").trim();
+  if (configuredUrl) return configuredUrl;
+
+  try {
+    const appUrl = new URL(process.env.WEB_APP_URL);
+    return new URL("/karta-share.jpg", appUrl.origin).toString();
+  } catch (error) {
+    return "";
+  }
+}
+
 function extractRoomIdFromInlineQuery(query = "") {
   const cleanQuery = String(query || "").trim();
   if (!cleanQuery) return "";
@@ -66,6 +88,11 @@ function extractRoomIdFromInlineQuery(query = "") {
     const queryParamMatch = cleanQuery.match(/[?&]roomId=([A-Za-z0-9_-]+)/i);
     return queryParamMatch?.[1] || "";
   }
+}
+
+function extractReferralCodeFromInlineQuery(query = "") {
+  const match = String(query || "").trim().match(/^ref_([a-f0-9]{18})$/i);
+  return match?.[1] || "";
 }
 
 function buildRoomInlineResult(room, roomUrl) {
@@ -98,6 +125,26 @@ function buildRoomInlineResult(room, roomUrl) {
 async function answerRoomInlineQuery(ctx, room, roomUrl) {
   const options = { cache_time: 0, is_personal: true };
   await ctx.answerInlineQuery([buildRoomInlineResult(room, roomUrl)], options);
+}
+
+function buildReferralInlineResult(code, photoUrl, launchUrl) {
+  return {
+    type: "photo",
+    id: `ref-${code}`,
+    photo_url: photoUrl,
+    thumbnail_url: photoUrl,
+    title: "Share Karta and earn coins",
+    description: "Invite a friend to play Karta.",
+    caption: [
+      "Play Karta and get coins!",
+      "Join rooms, play cards, and win rewards.",
+      "",
+      "Tap Play now to start.",
+    ].join("\n"),
+    reply_markup: {
+      inline_keyboard: [[{ text: "Play now", url: launchUrl }]],
+    },
+  };
 }
 
 /**
@@ -135,6 +182,27 @@ function createBot() {
   });
 
   bot.on('inline_query', async (ctx) => {
+    const referralCode = extractReferralCodeFromInlineQuery(ctx.inlineQuery?.query);
+    if (referralCode) {
+      try {
+        const referralLink = await getReferralLink(referralCode);
+        const photoUrl = buildReferralPhotoUrl();
+        const launchUrl = buildReferralLaunchUrl(referralCode, ctx.botInfo?.username);
+
+        if (!referralLink || !photoUrl || !launchUrl) {
+          return ctx.answerInlineQuery([], { cache_time: 0, is_personal: true });
+        }
+
+        return ctx.answerInlineQuery(
+          [buildReferralInlineResult(referralCode, photoUrl, launchUrl)],
+          { cache_time: 0, is_personal: true }
+        );
+      } catch (err) {
+        console.error('Bot inline referral share error:', err);
+        return ctx.answerInlineQuery([], { cache_time: 0, is_personal: true });
+      }
+    }
+
     const roomId = extractRoomIdFromInlineQuery(ctx.inlineQuery?.query);
 
     if (!roomId) {

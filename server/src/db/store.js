@@ -1230,6 +1230,18 @@ async function createReferralLink(userId, options = {}) {
   return result.rows[0];
 }
 
+async function getReferralLink(code) {
+  await ensureReferralTables();
+  const cleanCode = String(code || "").replace(/^ref_/, "").trim();
+  if (!cleanCode) return null;
+
+  const result = await query(
+    "SELECT * FROM referral_links WHERE code = $1 LIMIT 1",
+    [cleanCode]
+  );
+  return result.rows[0] || null;
+}
+
 async function awardReferralIfEligible(code, referredUserId) {
   await ensureReferralTables();
   const cleanCode = String(code || "").replace(/^ref_/, "");
@@ -1348,5 +1360,6 @@ module.exports = {
   addBalance,
   withdrawBalance,
   createReferralLink,
+  getReferralLink,
   awardReferralIfEligible,
 };
