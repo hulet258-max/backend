@@ -42,6 +42,13 @@ function buildRoomWebAppUrl(roomId) {
   }
 }
 
+function buildMiniAppLaunchUrl(startParam, botUsername = "") {
+  const cleanUsername = String(botUsername || "").replace(/^@/, "").trim();
+  const cleanStartParam = String(startParam || "").trim();
+  if (!cleanUsername || !cleanStartParam) return "";
+  return `https://t.me/${cleanUsername}?startapp=${encodeURIComponent(cleanStartParam)}`;
+}
+
 function buildReferralPhotoUrl() {
   const configuredUrl = String(process.env.REFERRAL_SHARE_PHOTO_URL || "").trim();
   if (configuredUrl) return configuredUrl;
@@ -75,17 +82,14 @@ function extractReferralCodeFromInlineQuery(query = "") {
   return match?.[1] || "";
 }
 
-function buildWebAppLoginButton(text, url) {
-  return {
-    text,
-    login_url: {
-      url,
-      request_write_access: true,
-    },
-  };
+function buildPlayButton(webAppUrl, fallbackUrl = "", useWebApp = true) {
+  if (useWebApp) {
+    return { text: "Play now", web_app: { url: webAppUrl } };
+  }
+  return { text: "Play now", url: fallbackUrl || webAppUrl };
 }
 
-function buildRoomInlineResult(room, roomUrl) {
+function buildRoomInlineResult(room, roomUrl, fallbackUrl = "", useWebApp = true) {
   const roomName = room.name || "Private room";
   const playerCount = Number(room.playerCount || 0);
   const maxPlayers = Number(room.maxPlayers || 0);
@@ -107,17 +111,29 @@ function buildRoomInlineResult(room, roomUrl) {
       ].join("\n"),
     },
     reply_markup: {
-      inline_keyboard: [[buildWebAppLoginButton("Play now", roomUrl)]],
+      inline_keyboard: [[buildPlayButton(roomUrl, fallbackUrl, useWebApp)]],
     },
   };
 }
 
-async function answerRoomInlineQuery(ctx, room, roomUrl) {
+async function answerRoomInlineQuery(ctx, room, roomUrl, fallbackUrl) {
   const options = { cache_time: 0, is_personal: true };
-  await ctx.answerInlineQuery([buildRoomInlineResult(room, roomUrl)], options);
+  try {
+    await ctx.answerInlineQuery(
+      [buildRoomInlineResult(room, roomUrl, fallbackUrl, true)],
+      options
+    );
+  } catch (error) {
+    const message = String(error?.description || error?.message || "");
+    if (!/web_app|button_type|BUTTON_TYPE/i.test(message)) throw error;
+    await ctx.answerInlineQuery(
+      [buildRoomInlineResult(room, roomUrl, fallbackUrl, false)],
+      options
+    );
+  }
 }
 
-function buildReferralInlineResult(code, photoUrl, launchUrl) {
+function buildReferralInlineResult(code, photoUrl, webAppUrl, fallbackUrl = "", useWebApp = true) {
   return {
     type: "photo",
     id: `ref-${code}`,
@@ -132,9 +148,26 @@ function buildReferralInlineResult(code, photoUrl, launchUrl) {
       "Tap Play now to start.",
     ].join("\n"),
     reply_markup: {
-      inline_keyboard: [[buildWebAppLoginButton("Play now", launchUrl)]],
+      inline_keyboard: [[buildPlayButton(webAppUrl, fallbackUrl, useWebApp)]],
     },
   };
+}
+
+async function answerReferralInlineQuery(ctx, code, photoUrl, webAppUrl, fallbackUrl) {
+  const options = { cache_time: 0, is_personal: true };
+  try {
+    await ctx.answerInlineQuery(
+      [buildReferralInlineResult(code, photoUrl, webAppUrl, fallbackUrl, true)],
+      options
+    );
+  } catch (error) {
+    const message = String(error?.description || error?.message || "");
+    if (!/web_app|button_type|BUTTON_TYPE/i.test(message)) throw error;
+    await ctx.answerInlineQuery(
+      [buildReferralInlineResult(code, photoUrl, webAppUrl, fallbackUrl, false)],
+      options
+    );
+  }
 }
 
 /**
@@ -177,16 +210,15 @@ function createBot() {
       try {
         const referralLink = await getReferralLink(referralCode);
         const photoUrl = buildReferralPhotoUrl();
-        const launchUrl = buildWebAppUrl(referralCode);
+        const webAppUrl = buildWebAppUrl(referralCode);
+        const fallbackUrl = buildMiniAppLaunchUrl(`ref_${referralCode}`, ctx.botInfo?.username);
 
-        if (!referralLink || !photoUrl || !launchUrl) {
+        if (!referralLink || !photoUrl || !webAppUrl) {
           return ctx.answerInlineQuery([], { cache_time: 0, is_personal: true });
         }
 
-        return ctx.answerInlineQuery(
-          [buildReferralInlineResult(referralCode, photoUrl, launchUrl)],
-          { cache_time: 0, is_personal: true }
-        );
+        await answerReferralInlineQuery(ctx, referralCode, photoUrl, webAppUrl, fallbackUrl);
+        return;
       } catch (err) {
         console.error('Bot inline referral share error:', err);
         return ctx.answerInlineQuery([], { cache_time: 0, is_personal: true });
@@ -202,12 +234,13 @@ function createBot() {
     try {
       const room = await getRoom(roomId);
       const roomUrl = buildRoomWebAppUrl(room?.id);
+      const fallbackUrl = buildMiniAppLaunchUrl(`room_${room?.id}`, ctx.botInfo?.username);
 
       if (!room || !roomUrl || room.visibility !== "private" || room.status !== "waiting") {
         return ctx.answerInlineQuery([], { cache_time: 0, is_personal: true });
       }
 
-      await answerRoomInlineQuery(ctx, room, roomUrl);
+      await answerRoomInlineQuery(ctx, room, roomUrl, fallbackUrl);
     } catch (err) {
       console.error('Bot inline room share error:', err);
       await ctx.answerInlineQuery([], { cache_time: 0, is_personal: true });
