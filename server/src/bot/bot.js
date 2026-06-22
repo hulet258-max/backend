@@ -42,26 +42,6 @@ function buildRoomWebAppUrl(roomId) {
   }
 }
 
-function buildRoomLaunchUrl(roomId, botUsername = "") {
-  const cleanUsername = String(botUsername || "").replace(/^@/, "").trim();
-  if (cleanUsername && roomId) {
-    const startParam = `room_${roomId}`;
-    return `https://t.me/${cleanUsername}?startapp=${encodeURIComponent(startParam)}`;
-  }
-
-  return buildRoomWebAppUrl(roomId);
-}
-
-function buildReferralLaunchUrl(code, botUsername = "") {
-  const cleanUsername = String(botUsername || "").replace(/^@/, "").trim();
-  const cleanCode = String(code || "").replace(/^ref_/, "").trim();
-  if (cleanUsername && cleanCode) {
-    return `https://t.me/${cleanUsername}?startapp=${encodeURIComponent(`ref_${cleanCode}`)}`;
-  }
-
-  return buildWebAppUrl(cleanCode);
-}
-
 function buildReferralPhotoUrl() {
   const configuredUrl = String(process.env.REFERRAL_SHARE_PHOTO_URL || "").trim();
   if (configuredUrl) return configuredUrl;
@@ -95,6 +75,16 @@ function extractReferralCodeFromInlineQuery(query = "") {
   return match?.[1] || "";
 }
 
+function buildWebAppLoginButton(text, url) {
+  return {
+    text,
+    login_url: {
+      url,
+      request_write_access: true,
+    },
+  };
+}
+
 function buildRoomInlineResult(room, roomUrl) {
   const roomName = room.name || "Private room";
   const playerCount = Number(room.playerCount || 0);
@@ -117,7 +107,7 @@ function buildRoomInlineResult(room, roomUrl) {
       ].join("\n"),
     },
     reply_markup: {
-      inline_keyboard: [[{ text: "Play now", url: roomUrl }]],
+      inline_keyboard: [[buildWebAppLoginButton("Play now", roomUrl)]],
     },
   };
 }
@@ -142,7 +132,7 @@ function buildReferralInlineResult(code, photoUrl, launchUrl) {
       "Tap Play now to start.",
     ].join("\n"),
     reply_markup: {
-      inline_keyboard: [[{ text: "Play now", url: launchUrl }]],
+      inline_keyboard: [[buildWebAppLoginButton("Play now", launchUrl)]],
     },
   };
 }
@@ -187,7 +177,7 @@ function createBot() {
       try {
         const referralLink = await getReferralLink(referralCode);
         const photoUrl = buildReferralPhotoUrl();
-        const launchUrl = buildReferralLaunchUrl(referralCode, ctx.botInfo?.username);
+        const launchUrl = buildWebAppUrl(referralCode);
 
         if (!referralLink || !photoUrl || !launchUrl) {
           return ctx.answerInlineQuery([], { cache_time: 0, is_personal: true });
@@ -211,7 +201,7 @@ function createBot() {
 
     try {
       const room = await getRoom(roomId);
-      const roomUrl = buildRoomLaunchUrl(room?.id, ctx.botInfo?.username);
+      const roomUrl = buildRoomWebAppUrl(room?.id);
 
       if (!room || !roomUrl || room.visibility !== "private" || room.status !== "waiting") {
         return ctx.answerInlineQuery([], { cache_time: 0, is_personal: true });
