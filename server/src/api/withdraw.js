@@ -50,7 +50,7 @@ router.post("/withdraw", async (req, res) => {
       await telegram.sendMessage(ADMIN_TELEGRAM_ID, message, {
         reply_markup: {
           inline_keyboard: [
-            [{ text: "Sent", callback_data: "withdraw_sent" }],
+            [{ text: "Sent", callback_data: `withdraw_sent:${telegramId}:${withdrawAmount}` }],
           ],
         },
       });

@@ -261,6 +261,35 @@ function createBot() {
     }
   });
 
+  bot.action(/^withdraw_sent:(.+):(\d+)$/, async (ctx) => {
+    try {
+      const userId = String(ctx.match?.[1] || "").trim();
+      const amount = Number(ctx.match?.[2] || 0);
+      const birrAmount = amount * COIN_BIRR_VALUE;
+
+      if (userId) {
+        await ctx.telegram.sendMessage(
+          userId,
+          [
+            "✅ Withdrawal sent",
+            "",
+            `Your withdrawal request for ${birrAmount} Birr has been marked as sent by admin.`,
+          ].join("\n")
+        );
+      }
+
+      await ctx.answerCbQuery('User notified');
+      await ctx.editMessageReplyMarkup({
+        inline_keyboard: [
+          [{ text: 'Done', callback_data: 'withdraw_done' }]
+        ]
+      });
+    } catch (err) {
+      console.error('Withdraw button callback error:', err);
+      await ctx.answerCbQuery('Could not notify user', { show_alert: true }).catch(() => {});
+    }
+  });
+
   bot.action('withdraw_sent', async (ctx) => {
     try {
       await ctx.answerCbQuery('Marked as done');
@@ -270,7 +299,7 @@ function createBot() {
         ]
       });
     } catch (err) {
-      console.error('Withdraw button callback error:', err);
+      console.error('Withdraw legacy button callback error:', err);
     }
   });
 
