@@ -280,4 +280,13 @@ async function startBot(bot) {
   await bot.launch();
 }
 
-module.exports = { createBot, startBot };
+module.exports = {
+  createBot,
+  startBot,
+  buildMiniAppLaunchUrl,
+  buildReferralInlineResult,
+  buildReferralPhotoUrl,
+  buildRoomInlineResult,
+  buildRoomWebAppUrl,
+  buildWebAppUrl,
+};
