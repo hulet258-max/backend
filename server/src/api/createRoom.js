@@ -2,6 +2,7 @@ const express = require("express");
 const router = express.Router();
 const {
   MIN_ROOM_ENTRY_COINS,
+  COIN_BIRR_VALUE,
   isWholeCoinAmount,
 } = require("../config/economy");
 const { redis } = require("../config/redis"); // import redis client
@@ -50,7 +51,7 @@ router.post("/create-room", async (req, res) => {
     if (!isWholeCoinAmount(entryFeeCoins) || entryFeeCoins < MIN_ROOM_ENTRY_COINS) {
       return res.status(400).json({
         success: false,
-        error: `Entry fee must be at least ${MIN_ROOM_ENTRY_COINS} coins.`,
+        error: `Entry fee must be at least ${MIN_ROOM_ENTRY_COINS * COIN_BIRR_VALUE} Birr.`,
       });
     }
 
@@ -63,7 +64,7 @@ router.post("/create-room", async (req, res) => {
     if (Number(creator.balance || 0) < entryFeeCoins) {
       return res.status(400).json({
         success: false,
-        error: "Insufficient coin balance to create this room.",
+        error: "Insufficient Birr balance to create this room.",
       });
     }
 

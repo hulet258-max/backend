@@ -183,7 +183,7 @@ router.post("/check-receipt-demo", async (req, res) => {
     if (paidBirr < MIN_DEPOSIT_BIRR) {
       return res.status(400).json({
         success: false,
-        error: `Minimum deposit is ${MIN_DEPOSIT_BIRR} birr (${MIN_DEPOSIT_COINS} coins).`,
+        error: `Minimum deposit is ${MIN_DEPOSIT_BIRR} Birr.`,
         transactionId,
         paidBirr,
       });

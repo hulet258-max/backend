@@ -1,6 +1,7 @@
 // server/src/bot/bot.js
 
 const { Telegraf } = require('telegraf');
+const { COIN_BIRR_VALUE } = require("../config/economy");
 const { ensureUser, getReferralLink, getRoom } = require("../db/store");
 
 const GAME_INTRO = [
@@ -12,7 +13,7 @@ const GAME_INTRO = [
   "3. Arrange your 11 cards into matching-rank groups of 4-3-3-1.",
   "4. When your hand is ready, tap Win to declare it.",
   "",
-  "Public and private rooms use coins; practice games are free.",
+  "Public and private rooms use Birr; practice games are free.",
 ].join("\n");
 
 function buildWebAppUrl(referralCode = "") {
@@ -95,19 +96,19 @@ function buildRoomInlineResult(room, roomUrl, fallbackUrl = "", useWebApp = true
   const roomName = room.name || "Private room";
   const playerCount = Number(room.playerCount || 0);
   const maxPlayers = Number(room.maxPlayers || 0);
-  const entryFee = Number(room.entryFee || 0);
+  const entryFee = Number(room.entryFee || 0) * COIN_BIRR_VALUE;
 
   return {
     type: "article",
     id: `room-${room.id}`,
     title: "Share private Karta game",
-    description: `${roomName} | ${playerCount}/${maxPlayers} players | ${entryFee} coins`,
+    description: `${roomName} | ${playerCount}/${maxPlayers} players | ${entryFee} Birr`,
     input_message_content: {
       message_text: [
         "Private Karta game",
         `Room: ${roomName}`,
         `Players: ${playerCount}/${maxPlayers}`,
-        `Entry: ${entryFee} coins`,
+        `Entry: ${entryFee} Birr`,
         "",
         "Tap Play now to join the game.",
       ].join("\n"),
@@ -141,10 +142,10 @@ function buildReferralInlineResult(code, photoUrl, webAppUrl, fallbackUrl = "", 
     id: `ref-${code}`,
     photo_url: photoUrl,
     thumbnail_url: photoUrl,
-    title: "Share Karta and earn coins",
+    title: "Share Karta and earn Birr",
     description: "Invite a friend to play Karta.",
     caption: [
-      "Play Karta and get coins!",
+      "Play Karta and get Birr!",
       "Join rooms, play cards, and win rewards.",
       "",
       "Tap Play now to start.",
@@ -191,17 +192,28 @@ function createBot() {
       console.error('Bot start user sync error:', err);
     }
 
-    await ctx.reply(GAME_INTRO, {
-      reply_markup: { remove_keyboard: true },
-    });
-
-    if (webAppUrl) {
-      await ctx.reply('Ready to play?', {
-        reply_markup: {
+    const photoUrl = buildReferralPhotoUrl();
+    const replyMarkup = webAppUrl ? {
           inline_keyboard: [
             [{ text: 'Play now', web_app: { url: webAppUrl } }]
           ]
-        }
+    } : undefined;
+
+    if (photoUrl) {
+      try {
+        await ctx.replyWithPhoto(photoUrl, {
+          caption: GAME_INTRO,
+          ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
+        });
+        return;
+      } catch (error) {
+        console.error("Bot start photo send failed:", error);
+      }
+    }
+
+    {
+      await ctx.reply(GAME_INTRO, {
+        ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
       });
     }
   });

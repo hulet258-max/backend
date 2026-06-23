@@ -1,6 +1,7 @@
 const express = require("express");
 const { Telegram } = require("telegraf");
 const {
+  COIN_BIRR_VALUE,
   MIN_WITHDRAW_COINS,
   isWholeCoinAmount,
 } = require("../config/economy");
@@ -30,7 +31,7 @@ router.post("/withdraw", async (req, res) => {
     if (!isWholeCoinAmount(withdrawAmount) || withdrawAmount < MIN_WITHDRAW_COINS) {
       return res.status(400).json({
         success: false,
-        error: `amount must be a whole coin amount greater than or equal to ${MIN_WITHDRAW_COINS}.`,
+        error: `amount must be at least ${MIN_WITHDRAW_COINS * COIN_BIRR_VALUE} Birr.`,
       });
     }
 
@@ -42,8 +43,8 @@ router.post("/withdraw", async (req, res) => {
         "💸 New Withdraw Request",
         `User Telegram ID: ${telegramId}`,
         `Phone: ${result.phone}`,
-        `Withdraw Amount: ${withdrawAmount} coins`,
-        `Balance After: ${result.nextBalance} coins`,
+        `Withdraw Amount: ${withdrawAmount * COIN_BIRR_VALUE} Birr`,
+        `Balance After: ${result.nextBalance * COIN_BIRR_VALUE} Birr`,
       ].join("\n");
 
       await telegram.sendMessage(ADMIN_TELEGRAM_ID, message, {
