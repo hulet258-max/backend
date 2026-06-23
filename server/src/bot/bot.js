@@ -33,12 +33,14 @@ function buildRoomWebAppUrl(roomId) {
   try {
     const url = new URL(webAppUrl);
     const basePath = url.pathname.replace(/\/$/, "");
-    url.pathname = `${basePath}/game/${encodeURIComponent(String(roomId))}`;
+    url.pathname = `${basePath}/second`;
     url.search = "";
+    url.searchParams.set("roomId", String(roomId));
+    url.searchParams.set("privateShare", "1");
     return url.toString();
   } catch (error) {
     const cleanBase = String(webAppUrl).replace(/\/$/, "");
-    return `${cleanBase}/game/${encodeURIComponent(String(roomId))}`;
+    return `${cleanBase}/second?roomId=${encodeURIComponent(String(roomId))}&privateShare=1`;
   }
 }
 

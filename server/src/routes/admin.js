@@ -1,6 +1,8 @@
 const express = require("express");
 const { query } = require("../config/postgres");
-const { ensureAppSchema } = require("../db/store");
+const { redis } = require("../config/redis");
+const { deleteRoom, ensureAppSchema, finalizeRoomLedger, getRoom } = require("../db/store");
+const { emitBalanceUpdates } = require("../services/balanceEvents");
 
 const router = express.Router();
 
@@ -507,6 +509,40 @@ router.get("/rooms", async (req, res) => {
   } catch (error) {
     console.error(" /api/admin/rooms error:", error);
     return res.status(500).json({ success: false, error: "Could not load rooms." });
+  }
+});
+
+router.delete("/rooms/:roomId", async (req, res) => {
+  try {
+    const { roomId } = req.params;
+    const room = await getRoom(roomId);
+
+    if (!room) {
+      return res.status(404).json({ success: false, error: "Active room not found." });
+    }
+
+    const roomStats = await finalizeRoomLedger(roomId, "admin-room-deleted");
+    await emitBalanceUpdates(req.app.get("io"), [
+      ...Object.keys(roomStats?.payouts || {}),
+      ...Object.keys(roomStats?.refunds || {}),
+    ]);
+    await deleteRoom(roomId, "admin-room-deleted");
+
+    if (redis.isOpen) {
+      await redis.del(`room:${roomId}`);
+      await redis.del("rooms:list");
+    }
+
+    const io = req.app.get("io");
+    if (io) {
+      io.emit("room_unavailable", { roomId });
+      io.emit("room_deleted", { roomId });
+    }
+
+    return res.json({ success: true, message: "Room deleted." });
+  } catch (error) {
+    console.error(" /api/admin/rooms/:roomId delete error:", error);
+    return res.status(500).json({ success: false, error: "Could not delete active room." });
   }
 });
 
