@@ -65,7 +65,7 @@ function extractRoomIdFromInlineQuery(query = "") {
   const cleanQuery = String(query || "").trim();
   if (!cleanQuery) return "";
 
-  const directMatch = cleanQuery.match(/^join[_\s-]?room[_\s:-]+([A-Za-z0-9_-]+(?:-[A-Za-z0-9_-]+)*)$/i);
+  const directMatch = cleanQuery.match(/(?:^|\s)(?:join[_\s-]?room|room)[_\s:-]+([A-Za-z0-9_-]+)/i);
   if (directMatch?.[1]) return directMatch[1];
 
   try {
@@ -78,7 +78,7 @@ function extractRoomIdFromInlineQuery(query = "") {
 }
 
 function extractReferralCodeFromInlineQuery(query = "") {
-  const match = String(query || "").trim().match(/^ref_([a-f0-9]{18})$/i);
+  const match = String(query || "").trim().match(/(?:^|\s)ref_([a-f0-9]{18})(?=\s|$|[.,!?])/i);
   return match?.[1] || "";
 }
 
