@@ -129,6 +129,27 @@ const ensureGameIsActive = (redisData, res) => {
 
 const getPlayerIds = (redisData) => (redisData.players || []).map((p) => p.telegramId);
 
+const shuffleCards = (cards = []) => {
+    const deck = [...cards];
+    for (let index = deck.length - 1; index > 0; index -= 1) {
+        const swapIndex = Math.floor(Math.random() * (index + 1));
+        [deck[index], deck[swapIndex]] = [deck[swapIndex], deck[index]];
+    }
+    return deck;
+};
+
+const refillDeckFromLaidCards = (redisData) => {
+    if ((redisData.deck || []).length > 0) return true;
+
+    const laidCards = (redisData.laidCards || []).filter(Boolean);
+    if (!laidCards.length) return false;
+
+    redisData.deck = shuffleCards(laidCards);
+    redisData.laidCards = [];
+    redisData.deckReshuffledAt = new Date().toISOString();
+    return true;
+};
+
 const moveTurnIfNeeded = (redisData, removedUserId, fallbackIds = getPlayerIds(redisData)) => {
     if (!fallbackIds.length) {
         redisData.turn = null;
@@ -156,6 +177,8 @@ const resetRoomToWaiting = (redisData) => {
     redisData.leaveVote = null;
     redisData.botActionCounts = { picks: 0, lays: 0 };
     redisData.lastPick = null;
+    redisData.lastLay = null;
+    redisData.lastCall = null;
 };
 
 // Helper to save room state to Redis and emit update to clients
@@ -227,9 +250,8 @@ router.post('/gameplay/take-card', async (req, res) => {
         }
 
         // Action: Pop from deck and push to hand
-        if (redisData.deck.length === 0) {
-            // TODO: Reshuffle laid cards into deck if deck is empty
-            return res.status(400).json({ error: 'Deck is empty!' });
+        if (!refillDeckFromLaidCards(redisData)) {
+            return res.status(400).json({ error: 'No cards left to draw.' });
         }
 
         const card = redisData.deck.pop(); // Take top card
@@ -347,6 +369,14 @@ router.post('/gameplay/lay-card', async (req, res) => {
 
         const nextPlayerIndex = (currentPlayerIndex + 1) % playerIds.length;
         redisData.turn = playerIds[nextPlayerIndex];
+        redisData.lastLay = {
+            playerId: String(userId),
+            targetPlayerId: String(redisData.turn),
+            card: laidCard,
+            at: new Date().toISOString(),
+            nonce: `${Date.now()}-${Math.random()}`,
+        };
+        redisData.lastCall = null;
 
         await saveAndEmitState(req, roomId, redisData, userId, socketId);
         if (isBotGameState(redisData)) {
@@ -477,6 +507,8 @@ router.post('/gameplay/play-again', async (req, res) => {
         redisData.leaveVote = null;
         redisData.botActionCounts = { picks: 0, lays: 0 };
         redisData.lastPick = null;
+        redisData.lastLay = null;
+        redisData.lastCall = null;
 
         await updateRoomStatus(roomId, "playing");
         await saveAndEmitState(req, roomId, redisData, userId, socketId);

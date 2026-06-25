@@ -20,7 +20,7 @@ function mapUser(row) {
     telegramId,
     phone: row.phone,
     username: row.username || "",
-    displayName: row.display_name || row.username || row.first_name || `Player ${telegramId.slice(-4)}`,
+    displayName: row.username || row.display_name || row.first_name || "User",
     firstName: row.first_name || "",
     lastName: row.last_name || "",
     balance: parseNumber(row.balance),
@@ -36,7 +36,7 @@ function mapPublicUser(row) {
   const telegramId = String(row.telegram_id);
   return {
     telegramId,
-    displayName: row.display_name || row.username || row.first_name || `Player ${telegramId.slice(-4)}`,
+    displayName: row.username || row.display_name || row.first_name || "User",
     firstName: row.first_name || "",
     username: row.username || "",
   };
@@ -144,8 +144,9 @@ async function createSyntheticBot({ telegramId, displayName, balance }) {
     `INSERT INTO users (
       telegram_id, username, display_name, first_name, balance, created_at, last_seen
     )
-    VALUES ($1, '', $2, $2, $3, NOW(), NOW())
+    VALUES ($1, $2, $2, $2, $3, NOW(), NOW())
     ON CONFLICT (telegram_id) DO UPDATE SET
+      username = EXCLUDED.username,
       display_name = EXCLUDED.display_name,
       first_name = EXCLUDED.first_name,
       balance = EXCLUDED.balance,

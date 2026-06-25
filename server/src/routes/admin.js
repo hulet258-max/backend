@@ -93,7 +93,7 @@ function mapUser(row) {
     telegramId,
     phone: row.phone || "",
     username: row.username || "",
-    displayName: row.display_name || row.username || row.first_name || `Player ${telegramId.slice(-4)}`,
+    displayName: row.username || row.display_name || row.first_name || "User",
     firstName: row.first_name || "",
     lastName: row.last_name || "",
     balance: parseNumber(row.balance),
@@ -267,7 +267,7 @@ async function getDeposits() {
   return result.rows.map((row) => ({
     id: row.id,
     userId: String(row.user_id),
-    userName: row.display_name || row.username || row.first_name || `Player ${String(row.user_id).slice(-4)}`,
+    userName: row.username || row.display_name || row.first_name || "User",
     amount: parseNumber(row.amount),
     timestamp: row.timestamp,
   }));
@@ -298,7 +298,7 @@ async function getReferrals() {
   return result.rows.map((row) => ({
     code: row.code,
     userId: String(row.user_id),
-    userName: row.display_name || row.username || row.first_name || `Player ${String(row.user_id).slice(-4)}`,
+    userName: row.username || row.display_name || row.first_name || "User",
     link: row.link,
     shareCount: Number(row.share_count || 0),
     rewardCount: Number(row.reward_count || 0),

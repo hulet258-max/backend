@@ -195,6 +195,39 @@ app.set('io', io);
         }
       });
 
+      socket.on("call_player", async (payload = {}) => {
+        try {
+          const roomId = String(payload.roomId || "").trim();
+          const fromUserId = String(payload.fromUserId || "").trim();
+          const targetUserId = String(payload.targetUserId || "").trim();
+          if (!roomId || !fromUserId || !targetUserId) return;
+
+          const rawRoomState = await redis.get(`room:${roomId}`);
+          if (!rawRoomState) return;
+          const roomState = JSON.parse(rawRoomState);
+          const players = roomState.players || [];
+          const fromPlayer = players.find((player) => String(player.telegramId) === fromUserId);
+          const targetPlayer = players.find((player) => String(player.telegramId) === targetUserId);
+          if (!fromPlayer || !targetPlayer) return;
+
+          const callPayload = {
+            roomId,
+            fromUserId,
+            targetUserId,
+            at: new Date().toISOString(),
+            nonce: `${Date.now()}-${Math.random()}`,
+          };
+          roomState.lastCall = callPayload;
+          await redis.set(`room:${roomId}`, JSON.stringify(roomState));
+
+          if (targetPlayer.socketId) {
+            io.to(targetPlayer.socketId).emit("player_call", callPayload);
+          }
+        } catch (error) {
+          console.error("Player call relay error:", error);
+        }
+      });
+
       // Handle Disconnect & Cleanup Redis
       socket.on("disconnect", async () => {
         console.log("❌ Client disconnected:", socket.id);

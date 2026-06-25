@@ -19,6 +19,7 @@ const {
 } = require("../db/store");
 const { createInitialGameState } = require("../services/gameService");
 const { emitBalanceUpdates } = require("../services/balanceEvents");
+const { getRandomExportUsername } = require("../services/exportUsernames");
 
 const BOT_PREFIX = "botgamer:";
 const BOT_TURN_DELAY_MIN_MS = 1200;
@@ -34,7 +35,7 @@ const BOT_ROOM_NAMES = [
   "Blue Nile Table",
   "Coffee Break Cards",
   "Golden Hand",
-  "Late Night Karta",
+  "Late Night Carta",
   "Merkato Masters",
   "Rift Valley Room",
   "Sunday Shuffle",
@@ -47,6 +48,26 @@ const getBotId = (userId) => `${BOT_PREFIX}${userId}`;
 const isJoker = (card) => String(card?.rank || "").toUpperCase() === "JOKER";
 const isPracticeState = (redisData) => Boolean(redisData?.practice);
 const isBotGameState = (redisData) => Boolean(redisData?.botGame || redisData?.practice);
+
+const shuffleCards = (cards = []) => {
+  const deck = [...cards];
+  for (let index = deck.length - 1; index > 0; index -= 1) {
+    const swapIndex = Math.floor(Math.random() * (index + 1));
+    [deck[index], deck[swapIndex]] = [deck[swapIndex], deck[index]];
+  }
+  return deck;
+};
+
+const refillDeckFromLaidCards = (redisData) => {
+  if ((redisData.deck || []).length > 0) return true;
+  const laidCards = (redisData.laidCards || []).filter(Boolean);
+  if (!laidCards.length) return false;
+
+  redisData.deck = shuffleCards(laidCards);
+  redisData.laidCards = [];
+  redisData.deckReshuffledAt = new Date().toISOString();
+  return true;
+};
 
 const getRankCounts = (cards = [], includeJokers = false) => cards.reduce((acc, card) => {
   const rank = card?.rank;
@@ -99,7 +120,7 @@ const wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, mill
 
 const buildManagedBotIdentity = () => {
   const suffix = randomInteger(10, 99);
-  const displayName = `${randomItem(BOT_FIRST_NAMES)} ${randomItem(BOT_LAST_NAMES)} ${suffix}`;
+  const displayName = getRandomExportUsername() || `${randomItem(BOT_FIRST_NAMES)}_${randomItem(BOT_LAST_NAMES)}_${suffix}`;
   return {
     id: `${BOT_PREFIX}managed:${randomUUID()}`,
     displayName,
@@ -236,7 +257,7 @@ const runBotTurn = async (req, roomId) => {
           nonce: `${Date.now()}-${Math.random()}`,
         };
         pickedCard = true;
-      } else if (redisData.deck?.length) {
+      } else if (refillDeckFromLaidCards(redisData)) {
         redisData.playerCards[botId].push(redisData.deck.pop());
         redisData.botActionCounts.picks += 1;
         redisData.lastPick = {
@@ -281,9 +302,11 @@ const runBotTurn = async (req, roomId) => {
     }
 
     const updatedHand = redisData.playerCards?.[botId] || [];
+    let botLaidCard = null;
     if (updatedHand.length === 11) {
       const discardIndex = chooseDiscardIndex(updatedHand);
       const [discardedCard] = updatedHand.splice(discardIndex, 1);
+      botLaidCard = discardedCard;
       redisData.laidCards = redisData.laidCards || [];
       redisData.laidCards.push(discardedCard);
       redisData.botActionCounts.lays += 1;
@@ -292,6 +315,16 @@ const runBotTurn = async (req, roomId) => {
     const playerIds = (redisData.players || []).map((player) => player.telegramId);
     const botIndex = playerIds.findIndex((playerId) => String(playerId) === botId);
     redisData.turn = playerIds[(botIndex + 1) % playerIds.length];
+    if (botLaidCard) {
+      redisData.lastLay = {
+        playerId: botId,
+        targetPlayerId: String(redisData.turn),
+        card: botLaidCard,
+        at: new Date().toISOString(),
+        nonce: `${Date.now()}-${Math.random()}`,
+      };
+      redisData.lastCall = null;
+    }
 
     await emitBotState(req, roomId, redisData);
   } finally {
@@ -519,6 +552,8 @@ router.post("/bot-game/start", async (req, res) => {
       roomStats,
       botActionCounts: { picks: 0, lays: 0 },
       lastPick: null,
+      lastLay: null,
+      lastCall: null,
       lastActivityAt: new Date().toISOString(),
     };
 

@@ -102,6 +102,8 @@ router.post("/join-room", async (req, res) => {
                   redisData.status = "playing";
                   redisData.botActionCounts = { picks: 0, lays: 0 };
                   redisData.lastPick = null;
+                  redisData.lastLay = null;
+                  redisData.lastCall = null;
                 }
               }
               await redis.set(`room:${roomId}`, JSON.stringify(redisData));
@@ -194,6 +196,8 @@ router.post("/join-room", async (req, res) => {
         redisData.lastActivityAt = new Date().toISOString();
         redisData.botActionCounts = { picks: 0, lays: 0 };
         redisData.lastPick = null;
+        redisData.lastLay = null;
+        redisData.lastCall = null;
       }
 
       await redis.set(key, JSON.stringify(redisData));

@@ -5,7 +5,7 @@ const { COIN_BIRR_VALUE } = require("../config/economy");
 const { ensureUser, getReferralLink, getRoom } = require("../db/store");
 
 const GAME_INTRO = [
-  "Welcome to Karta!",
+  "Welcome to Carta!",
   "",
   "How to play:",
   "1. Join a room or practice against the bot.",
@@ -101,11 +101,11 @@ function buildRoomInlineResult(room, roomUrl, fallbackUrl = "", useWebApp = true
   return {
     type: "article",
     id: `room-${room.id}`,
-    title: "Share private Karta game",
+    title: "Share private Carta game",
     description: `${roomName} | ${playerCount}/${maxPlayers} players | ${entryFee} Birr`,
     input_message_content: {
       message_text: [
-        "Private Karta game",
+        "Private Carta game",
         `Room: ${roomName}`,
         `Players: ${playerCount}/${maxPlayers}`,
         `Entry: ${entryFee} Birr`,
@@ -142,10 +142,10 @@ function buildReferralInlineResult(code, photoUrl, webAppUrl, fallbackUrl = "", 
     id: `ref-${code}`,
     photo_url: photoUrl,
     thumbnail_url: photoUrl,
-    title: "Share Karta and earn Birr",
-    description: "Invite a friend to play Karta.",
+    title: "Share Carta and earn Birr",
+    description: "Invite a friend to play Carta.",
     caption: [
-      "Play Karta and get Birr!",
+      "Play Carta and get Birr!",
       "Join rooms, play cards, and win rewards.",
       "",
       "Tap Play now to start.",
