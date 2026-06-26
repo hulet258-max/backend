@@ -9,7 +9,13 @@ const { Server } = require('socket.io');
 
 const { testConnection } = require('./config/postgres');
 const { redis, connectRedis } = require('./config/redis');
-const { deleteRoom, ensureAppSchema, finalizeRoomLedger } = require('./db/store');
+const {
+  deleteRoom,
+  ensureAppSchema,
+  finalizeRoomLedger,
+  getRoom,
+  listActiveRoomsForCleanup,
+} = require('./db/store');
 
 const { createBot, startBot } = require('./bot/bot');
 const userRoutes = require('./routes/user/user');
@@ -39,12 +45,45 @@ const ROOM_CLEANUP_INTERVAL_MS = 60 * 1000;
 const MANAGED_BOT_WAIT_TIMEOUT_MS = 10 * 60 * 1000;
 const BOT_ROOM_RECONCILE_INTERVAL_MS = 15 * 1000;
 
+const getMoneyEventUserIds = (roomStats = {}) => [
+  ...Object.keys(roomStats.payouts || {}),
+  ...Object.keys(roomStats.refunds || {}),
+];
+
+async function deleteRoomEverywhere(io, roomId, reason, roomState = null, roomData = null) {
+  const room = roomData || await getRoom(roomId);
+  const isPracticeRoom = Boolean(
+    roomState?.practice ||
+    roomState?.roomStats?.practice ||
+    room?.roomStats?.practice
+  );
+
+  let roomStats = null;
+  if (room && !isPracticeRoom) {
+    roomStats = await finalizeRoomLedger(roomId, reason);
+    await emitBalanceUpdates(io, getMoneyEventUserIds(roomStats));
+  }
+
+  await deleteRoom(roomId, reason);
+  await redis.del(`room:${roomId}`);
+  await redis.del(`room:${roomId}:bot-lock`);
+  await redis.del('rooms:list');
+
+  if (io) {
+    io.emit('room_unavailable', { roomId });
+    io.emit('room_deleted', { roomId });
+  }
+
+  return roomStats;
+}
+
 async function deleteIdleRooms(io) {
   if (!redis.isOpen) return;
 
   try {
     const keys = await redis.keys('room:*');
     const now = Date.now();
+    const deletedRoomIds = new Set();
 
     for (const key of keys) {
       if (key.endsWith(':bot-lock')) continue;
@@ -74,33 +113,32 @@ async function deleteIdleRooms(io) {
         now - lastActivityTime >= MANAGED_BOT_WAIT_TIMEOUT_MS
       ) {
         await deleteManagedBotRoom(io, roomId, roomState.generatedFor);
+        deletedRoomIds.add(String(roomId));
         continue;
       }
       if (!Number.isFinite(lastActivityTime) || now - lastActivityTime < ROOM_IDLE_TIMEOUT_MS) {
         continue;
       }
 
-      if (roomState.practice) {
-        await deleteRoom(roomId, 'practice-idle-cleanup');
-        await redis.del(key);
-        await redis.del('rooms:list');
-        io.emit('room_unavailable', { roomId });
-        io.emit('room_deleted', { roomId });
-        console.log(`[cleanup] Deleted idle practice room ${roomId}.`);
-        continue;
-      }
-
-      const roomStats = await finalizeRoomLedger(roomId, 'idle-cleanup');
-      await emitBalanceUpdates(io, [
-        ...Object.keys(roomStats?.payouts || {}),
-        ...Object.keys(roomStats?.refunds || {}),
-      ]);
-      await deleteRoom(roomId, 'idle-cleanup');
-      await redis.del(key);
-      await redis.del('rooms:list');
-      io.emit('room_unavailable', { roomId });
-      io.emit('room_deleted', { roomId });
+      const reason = roomState.practice ? 'practice-idle-cleanup' : 'idle-cleanup';
+      await deleteRoomEverywhere(io, roomId, reason, roomState);
+      deletedRoomIds.add(String(roomId));
       console.log(`[cleanup] Deleted idle room ${roomId} after 30 minutes without play.`);
+    }
+
+    const staleCutoff = new Date(now - ROOM_IDLE_TIMEOUT_MS);
+    const staleActiveRooms = await listActiveRoomsForCleanup(staleCutoff);
+    for (const room of staleActiveRooms) {
+      const roomId = String(room.id);
+      if (deletedRoomIds.has(roomId)) continue;
+
+      const redisState = await redis.get(`room:${roomId}`);
+      if (redisState) continue;
+
+      const reason = room.roomStats?.practice ? 'practice-orphan-cleanup' : 'orphan-idle-cleanup';
+      await deleteRoomEverywhere(io, roomId, reason, null, room);
+      deletedRoomIds.add(roomId);
+      console.log(`[cleanup] Deleted orphan active room ${roomId} with no Redis game state.`);
     }
   } catch (error) {
     console.error('[cleanup] Idle room cleanup error:', error);

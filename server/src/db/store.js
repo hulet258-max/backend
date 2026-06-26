@@ -486,7 +486,12 @@ async function createRoom(room) {
       JSON.stringify(room.roomStats || { gamesPlayed: 0, winnerCounts: {} }),
     ]
   );
-  return mapRoom(result.rows[0]);
+  const createdRoom = mapRoom(result.rows[0]);
+  await query(
+    "UPDATE users SET room_in = $1 WHERE telegram_id = ANY($2::text[])",
+    [String(createdRoom.id), (createdRoom.players || []).map(String)]
+  );
+  return createdRoom;
 }
 
 async function getRoom(roomId) {
@@ -552,6 +557,12 @@ async function deleteRoom(roomId, archiveReason = "") {
       );
     }
 
+    await client.query(
+      `UPDATE users
+      SET room_in = NULL
+      WHERE room_in = $1 OR telegram_id = ANY($2::text[])`,
+      [String(roomId), (room.players || []).map(String)]
+    );
     await client.query("DELETE FROM rooms WHERE id = $1", [String(roomId)]);
     await client.query("COMMIT");
 
@@ -680,6 +691,17 @@ async function listLobbyRooms(userId) {
   return result.rows.map(mapRoom);
 }
 
+async function listActiveRoomsForCleanup(olderThanDate) {
+  const result = await query(
+    `SELECT * FROM rooms
+    WHERE status IN ('waiting', 'playing', 'ended')
+      AND created_at <= $1
+    ORDER BY created_at ASC`,
+    [olderThanDate]
+  );
+  return result.rows.map(mapRoom);
+}
+
 async function updateRoomStatus(roomId, status) {
   const result = await query(
     "UPDATE rooms SET status = $2 WHERE id = $1 RETURNING *",
@@ -703,7 +725,14 @@ async function addPlayerToRoom(roomId, userId) {
     RETURNING *`,
     [String(roomId), String(userId)]
   );
-  return mapRoom(result.rows[0]);
+  const room = mapRoom(result.rows[0]);
+  if (room) {
+    await query(
+      "UPDATE users SET room_in = $1 WHERE telegram_id = $2",
+      [String(roomId), String(userId)]
+    );
+  }
+  return room;
 }
 
 async function removePlayerFromRoom(roomId, userId) {
@@ -714,6 +743,10 @@ async function removePlayerFromRoom(roomId, userId) {
     WHERE id = $1
     RETURNING *`,
     [String(roomId), String(userId)]
+  );
+  await query(
+    "UPDATE users SET room_in = NULL WHERE telegram_id = $1 AND room_in = $2",
+    [String(userId), String(roomId)]
   );
   return mapRoom(result.rows[0]);
 }
@@ -1349,6 +1382,7 @@ module.exports = {
   getAffordableJoinableHumanRoom,
   getWaitingManagedBotRoomForUser,
   listLobbyRooms,
+  listActiveRoomsForCleanup,
   addPlayerToRoom,
   removePlayerFromRoom,
   updateRoomStatus,
