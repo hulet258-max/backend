@@ -33,6 +33,7 @@ const {
   deleteManagedBotRoom,
   ensureManagedBotRoomForUser,
   reconcileConnectedUsers,
+  scheduleBotTurn,
 } = botGamerRoutes;
 const adminRoutes = require('./routes/admin');
 const settingsRoutes = require('./routes/settings');
@@ -260,6 +261,8 @@ app.set('io', io);
 
           if (targetPlayer.socketId) {
             io.to(targetPlayer.socketId).emit("player_call", callPayload);
+          } else if (String(targetUserId).startsWith("botgamer:")) {
+            scheduleBotTurn({ app }, roomId);
           }
         } catch (error) {
           console.error("Player call relay error:", error);
