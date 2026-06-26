@@ -28,8 +28,6 @@ const BOT_PICK_TO_LAY_MIN_MS = 850;
 const BOT_PICK_TO_LAY_MAX_MS = 1800;
 const MANAGED_ROOM_TTL_SECONDS = 10 * 60;
 const BOT_ENTRY_FEES = [2, 3, 5, 10];
-const BOT_FIRST_NAMES = ["Abel", "Dawit", "Elias", "Hana", "Kaleb", "Liya", "Mikael", "Nahom", "Ruth", "Saron"];
-const BOT_LAST_NAMES = ["Alem", "Bekele", "Desta", "Fikru", "Kebede", "Mekonnen", "Solomon", "Tadesse", "Tesfaye", "Worku"];
 const BOT_ROOM_NAMES = [
   "Addis Card Club",
   "Blue Nile Table",
@@ -120,7 +118,7 @@ const wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, mill
 
 const buildManagedBotIdentity = () => {
   const suffix = randomInteger(10, 99);
-  const displayName = getRandomExportUsername() || `${randomItem(BOT_FIRST_NAMES)}_${randomItem(BOT_LAST_NAMES)}_${suffix}`;
+  const displayName = getRandomExportUsername() || `user_${suffix}_${randomUUID().slice(0, 6)}`;
   return {
     id: `${BOT_PREFIX}managed:${randomUUID()}`,
     displayName,

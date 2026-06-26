@@ -6,8 +6,13 @@ let cachedUsernames = null;
 
 const EXPORT_FILE_NAME = "users_export_2026-06-25.xlsx";
 
-function getDefaultExportPath() {
-  return path.resolve(__dirname, "..", "..", "..", "..", "frontend", "karta", "public", EXPORT_FILE_NAME);
+function getExportPathCandidates() {
+  return [
+    process.env.BOT_USERNAME_EXPORT_PATH,
+    path.resolve(__dirname, "..", EXPORT_FILE_NAME),
+    path.resolve(__dirname, "..", "..", "..", "..", "frontend", "karta", "public", EXPORT_FILE_NAME),
+    path.resolve(__dirname, "..", "..", "..", "..", "frontend", "karta", "build", EXPORT_FILE_NAME),
+  ].filter(Boolean);
 }
 
 function decodeXml(value = "") {
@@ -136,7 +141,7 @@ function normalizeUsername(value) {
 function loadExportUsernames() {
   if (cachedUsernames) return cachedUsernames;
 
-  const exportPath = process.env.BOT_USERNAME_EXPORT_PATH || getDefaultExportPath();
+  const exportPath = getExportPathCandidates().find((candidate) => fs.existsSync(candidate)) || getExportPathCandidates()[0];
   try {
     const buffer = fs.readFileSync(exportPath);
     const entries = readZipEntries(buffer);
