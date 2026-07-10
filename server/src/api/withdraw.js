@@ -16,14 +16,32 @@ function toNumber(value) {
   return Number.isFinite(parsed) ? parsed : NaN;
 }
 
+function normalizePhone(value) {
+  return String(value || "").trim().replace(/\s+/g, " ");
+}
+
+function isValidPhoneNumber(value) {
+  const phone = normalizePhone(value);
+  const digits = phone.replace(/\D/g, "");
+  return /^\+?[0-9\s\-()]+$/.test(phone) && digits.length >= 9 && digits.length <= 15;
+}
+
 router.post("/withdraw", async (req, res) => {
   try {
     const { telegramId, amount } = req.body;
+    const phone = normalizePhone(req.body?.phone);
 
     if (!telegramId) {
       return res.status(400).json({
         success: false,
         error: "telegramId is required.",
+      });
+    }
+
+    if (!isValidPhoneNumber(phone)) {
+      return res.status(400).json({
+        success: false,
+        error: "Enter a valid phone number.",
       });
     }
 
@@ -35,7 +53,7 @@ router.post("/withdraw", async (req, res) => {
       });
     }
 
-    const result = await withdrawBalance(telegramId, withdrawAmount);
+    const result = await withdrawBalance(telegramId, withdrawAmount, phone);
 
     if (process.env.BOT_TOKEN) {
       const telegram = new Telegram(process.env.BOT_TOKEN);
@@ -64,11 +82,14 @@ router.post("/withdraw", async (req, res) => {
       telegramId: String(telegramId),
       withdrawnAmount: withdrawAmount,
       previousBalance: result.currentBalance,
+      previousWithdrawableBalance: result.withdrawableBalance,
+      nonWithdrawableBalance: result.nonWithdrawableBalance,
       newBalance: result.nextBalance,
+      newWithdrawableBalance: result.nextWithdrawableBalance,
       phone: result.phone,
       limits: {
         minWithdraw: MIN_WITHDRAW_COINS,
-        maxWithdraw: result.currentBalance,
+        maxWithdraw: result.nextWithdrawableBalance,
       },
     });
   } catch (error) {
@@ -79,10 +100,12 @@ router.post("/withdraw", async (req, res) => {
       });
     }
 
-    if (error.message === "INSUFFICIENT_BALANCE") {
+    if (error.message === "INSUFFICIENT_BALANCE" || error.message === "INSUFFICIENT_WITHDRAWABLE_BALANCE") {
       return res.status(400).json({
         success: false,
-        error: "Insufficient balance for this withdraw amount.",
+        error: "This amount includes welcome/share gift Birr, which cannot be withdrawn.",
+        withdrawableBalance: error.withdrawableBalance || 0,
+        nonWithdrawableBalance: error.nonWithdrawableBalance || 0,
       });
     }
 

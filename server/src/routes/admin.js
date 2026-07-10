@@ -219,6 +219,7 @@ async function getUsers() {
       FROM referral_links
       GROUP BY user_id
     ) ref ON ref.user_id = u.telegram_id
+    WHERE u.telegram_id NOT LIKE 'botgamer:%'
     ORDER BY u.last_seen DESC
   `);
   return result.rows.map(mapUser);
@@ -494,6 +495,68 @@ router.get("/users", async (req, res) => {
   } catch (error) {
     console.error(" /api/admin/users error:", error);
     return res.status(500).json({ success: false, error: "Could not load users." });
+  }
+});
+
+router.delete("/users/:userId", async (req, res) => {
+  try {
+    const userId = String(req.params.userId || "").trim();
+    if (!userId) {
+      return res.status(400).json({ success: false, error: "Missing user ID." });
+    }
+
+    const userResult = await query("SELECT * FROM users WHERE telegram_id = $1", [userId]);
+    if (!userResult.rows[0]) {
+      return res.status(404).json({ success: false, error: "User not found." });
+    }
+
+    const roomResult = await query(
+      "SELECT id FROM rooms WHERE creator_id = $1 OR players @> ARRAY[$1::text]",
+      [userId]
+    );
+    const deletedRoomIds = [];
+    const balanceUpdateIds = new Set();
+
+    for (const row of roomResult.rows) {
+      const roomId = String(row.id);
+      const roomStats = await finalizeRoomLedger(roomId, "admin-user-deleted");
+      Object.keys(roomStats?.payouts || {}).forEach((id) => balanceUpdateIds.add(id));
+      Object.keys(roomStats?.refunds || {}).forEach((id) => balanceUpdateIds.add(id));
+      await deleteRoom(roomId, "admin-user-deleted");
+
+      if (redis.isOpen) {
+        await redis.del(`room:${roomId}`);
+        await redis.del(`room:${roomId}:bot-lock`);
+      }
+      deletedRoomIds.push(roomId);
+    }
+
+    await query("DELETE FROM users WHERE telegram_id = $1", [userId]);
+
+    if (redis.isOpen) {
+      await redis.del(`user:${userId}:socket`);
+      await redis.del(`managed-bot-room:${userId}`);
+      await redis.del("rooms:list");
+    }
+
+    const io = req.app.get("io");
+    await emitBalanceUpdates(io, [...balanceUpdateIds].filter((id) => id !== userId));
+    if (io) {
+      deletedRoomIds.forEach((roomId) => {
+        io.emit("room_unavailable", { roomId });
+        io.emit("room_deleted", { roomId });
+      });
+    }
+
+    return res.json({
+      success: true,
+      message: "User deleted.",
+      deletedUserId: userId,
+      deletedRoomIds,
+    });
+  } catch (error) {
+    console.error(" /api/admin/users/:userId delete error:", error);
+    return res.status(500).json({ success: false, error: "Could not delete user." });
   }
 });
 

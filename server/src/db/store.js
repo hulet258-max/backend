@@ -15,6 +15,8 @@ function parseNumber(value) {
 function mapUser(row) {
   if (!row) return null;
   const telegramId = String(row.telegram_id);
+  const balance = parseNumber(row.balance);
+  const nonWithdrawableBalance = Math.min(balance, parseNumber(row.non_withdrawable_balance));
   return {
     id: telegramId,
     telegramId,
@@ -23,7 +25,9 @@ function mapUser(row) {
     displayName: row.username || row.display_name || row.first_name || "User",
     firstName: row.first_name || "",
     lastName: row.last_name || "",
-    balance: parseNumber(row.balance),
+    balance,
+    nonWithdrawableBalance,
+    withdrawableBalance: Math.max(balance - nonWithdrawableBalance, 0),
     roomIn: row.room_in,
     depositSum: parseNumber(row.deposit_sum),
     createdAt: row.created_at,
@@ -73,21 +77,21 @@ function roundMoney(value) {
 function getCommissionRate(entryFee, gamesPlayed = 0) {
   const fee = roundMoney(entryFee);
   if (fee <= 0) return 0;
-  let rate = 0.02;
-  if (fee >= 250) rate = 0.12;
-  else if (fee >= 100) rate = 0.1;
-  else if (fee >= 50) rate = 0.08;
-  else if (fee >= 25) rate = 0.06;
-  else if (fee >= 10) rate = 0.04;
+  let rate = 0.01;
+  if (fee >= 250) rate = 0.05;
+  else if (fee >= 100) rate = 0.04;
+  else if (fee >= 50) rate = 0.03;
+  else if (fee >= 25) rate = 0.02;
+  else if (fee >= 10) rate = 0.015;
 
-  const playedGrowth = Math.max(Number(gamesPlayed || 0), 0) * 0.01;
-  return Math.min(rate + playedGrowth, 0.25);
+  const playedGrowth = Math.max(Number(gamesPlayed || 0), 0) * 0.0025;
+  return Math.min(rate + playedGrowth, 0.08);
 }
 
 function calculateCommissionAmount(totalPot, entryFee, gamesPlayed = 0) {
   const pot = roundMoney(totalPot);
   if (pot <= 0) return 0;
-  return Math.min(pot, Math.max(1, Math.ceil(pot * getCommissionRate(entryFee, gamesPlayed))));
+  return Math.min(pot, Math.max(0, Math.round(pot * getCommissionRate(entryFee, gamesPlayed))));
 }
 
 function normalizeRoomStats(stats = {}) {
@@ -103,6 +107,7 @@ function normalizeRoomStats(stats = {}) {
     escrowSettled: Boolean(stats.escrowSettled),
     escrowPlayers: (stats.escrowPlayers || []).map(String),
     currentRoundPlayers: (stats.currentRoundPlayers || []).map(String),
+    currentRoundBonusEscrow: stats.currentRoundBonusEscrow || {},
     currentRoundPot: roundMoney(stats.currentRoundPot || 0),
     entryFee,
     totalPot: roundMoney(stats.totalPot || 0),
@@ -112,6 +117,7 @@ function normalizeRoomStats(stats = {}) {
     playerFeesPaid: stats.playerFeesPaid || {},
     payouts: stats.payouts || {},
     refunds: stats.refunds || {},
+    bonusRefunds: stats.bonusRefunds || {},
     topWinnerIds: (stats.topWinnerIds || []).map(String),
     finalizedReason: stats.finalizedReason || null,
     finalizedAt: stats.finalizedAt || null,
@@ -177,11 +183,59 @@ async function deleteSyntheticBot(botId) {
   );
 }
 
+async function cleanupManagedBotUserForRoom(roomId) {
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+    const roomResult = await client.query("SELECT * FROM rooms WHERE id = $1 FOR UPDATE", [String(roomId)]);
+    const room = roomResult.rows[0];
+    if (!room) {
+      await client.query("COMMIT");
+      return null;
+    }
+
+    const roomStats = normalizeRoomStats(room.room_stats || {});
+    if (!roomStats.managedBotRoom) {
+      await client.query("COMMIT");
+      return null;
+    }
+
+    const botId = String(roomStats.botProfile?.id || (room.players || []).find((playerId) => (
+      String(playerId).startsWith("botgamer:managed:")
+    )) || "");
+    if (!botId.startsWith("botgamer:managed:")) {
+      await client.query("COMMIT");
+      return null;
+    }
+
+    const generatedFor = roomStats.generatedFor ? String(roomStats.generatedFor) : "";
+    if (generatedFor && String(room.creator_id) === botId) {
+      const ownerResult = await client.query("SELECT 1 FROM users WHERE telegram_id = $1", [generatedFor]);
+      if (ownerResult.rowCount > 0) {
+        await client.query("UPDATE rooms SET creator_id = $2 WHERE id = $1", [String(roomId), generatedFor]);
+      }
+    }
+
+    await client.query(
+      "DELETE FROM users WHERE telegram_id = $1 AND telegram_id LIKE 'botgamer:managed:%'",
+      [botId]
+    );
+    await client.query("COMMIT");
+    return botId;
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 async function ensureUser(telegramId) {
   const cleanTelegramId = String(telegramId);
   const insertResult = await query(
-    `INSERT INTO users (telegram_id, balance)
-    VALUES ($1, $2)
+    `INSERT INTO users (telegram_id, balance, non_withdrawable_balance)
+    VALUES ($1, $2, $2)
     ON CONFLICT (telegram_id) DO NOTHING
     RETURNING *`,
     [cleanTelegramId, WELCOME_GIFT_COINS]
@@ -230,6 +284,7 @@ async function ensureAppSchemaOnce() {
       first_name TEXT DEFAULT '',
       last_name TEXT DEFAULT '',
       balance NUMERIC(12, 0) NOT NULL DEFAULT 0,
+      non_withdrawable_balance NUMERIC(12, 0) NOT NULL DEFAULT 0,
       room_in TEXT,
       deposit_sum NUMERIC(12, 0) NOT NULL DEFAULT 0,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -242,6 +297,7 @@ async function ensureAppSchemaOnce() {
   await query("ALTER TABLE users ADD COLUMN IF NOT EXISTS first_name TEXT DEFAULT ''");
   await query("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_name TEXT DEFAULT ''");
   await query("ALTER TABLE users ADD COLUMN IF NOT EXISTS balance NUMERIC(12, 0) NOT NULL DEFAULT 0");
+  await query("ALTER TABLE users ADD COLUMN IF NOT EXISTS non_withdrawable_balance NUMERIC(12, 0) NOT NULL DEFAULT 0");
   await query("ALTER TABLE users ADD COLUMN IF NOT EXISTS room_in TEXT");
   await query("ALTER TABLE users ADD COLUMN IF NOT EXISTS deposit_sum NUMERIC(12, 0) NOT NULL DEFAULT 0");
   await query("ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()");
@@ -308,8 +364,51 @@ async function ensureAppSchemaOnce() {
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `);
+  await backfillNonWithdrawableGiftBalance();
   await ensureRoomArchiveTable();
   await ensureAdminContentTables();
+}
+
+async function backfillNonWithdrawableGiftBalance() {
+  await query(
+    `UPDATE users u
+    SET non_withdrawable_balance = LEAST(
+      u.balance,
+      GREATEST(
+        0,
+        $1::numeric
+        + COALESCE((
+          SELECT SUM(ra.amount)
+          FROM referral_awards ra
+          WHERE ra.referrer_id = u.telegram_id
+        ), 0)
+        - COALESCE((
+          SELECT ugs.amount_played
+          FROM user_game_stats ugs
+          WHERE ugs.user_id = u.telegram_id
+        ), 0)
+      )
+    )
+    WHERE u.non_withdrawable_balance = 0
+      AND LEAST(
+        u.balance,
+        GREATEST(
+          0,
+          $1::numeric
+          + COALESCE((
+            SELECT SUM(ra.amount)
+            FROM referral_awards ra
+            WHERE ra.referrer_id = u.telegram_id
+          ), 0)
+          - COALESCE((
+            SELECT ugs.amount_played
+            FROM user_game_stats ugs
+            WHERE ugs.user_id = u.telegram_id
+          ), 0)
+        )
+      ) > 0`,
+    [WELCOME_GIFT_COINS]
+  );
 }
 
 function normalizeDisplayName(value) {
@@ -434,11 +533,15 @@ async function incrementUserGamesPlayed(userIds) {
 async function upsertUser(telegramUser) {
   const telegramId = String(telegramUser.telegramId);
   const initialBalance = telegramUser.balance ?? WELCOME_GIFT_COINS;
+  const initialNonWithdrawable = telegramUser.nonWithdrawableBalance ?? (
+    telegramUser.balance === undefined ? WELCOME_GIFT_COINS : 0
+  );
   const result = await query(
     `INSERT INTO users (
-      telegram_id, phone, username, first_name, last_name, balance, room_in, deposit_sum, created_at, last_seen
+      telegram_id, phone, username, first_name, last_name, balance, non_withdrawable_balance,
+      room_in, deposit_sum, created_at, last_seen
     )
-    VALUES ($1, $2, $3, $4, $5, COALESCE($6, 0), $7, COALESCE($8, 0), COALESCE($9, NOW()), COALESCE($10, NOW()))
+    VALUES ($1, $2, $3, $4, $5, COALESCE($6, 0), COALESCE($7, 0), $8, COALESCE($9, 0), COALESCE($10, NOW()), COALESCE($11, NOW()))
     ON CONFLICT (telegram_id) DO UPDATE SET
       phone = EXCLUDED.phone,
       username = EXCLUDED.username,
@@ -453,6 +556,7 @@ async function upsertUser(telegramUser) {
       telegramUser.firstName || "",
       telegramUser.lastName || "",
       initialBalance,
+      initialNonWithdrawable,
       telegramUser.roomIn || null,
       telegramUser.depositSum,
       telegramUser.createdAt || null,
@@ -785,7 +889,7 @@ async function escrowRoomEntryFees(roomId, playerIds, entryFee) {
     const normalizedPlayerIds = playerIds.map(String);
     const fee = roundMoney(entryFee);
     const usersResult = await client.query(
-      "SELECT telegram_id, balance FROM users WHERE telegram_id = ANY($1::text[]) FOR UPDATE",
+      "SELECT telegram_id, balance, non_withdrawable_balance FROM users WHERE telegram_id = ANY($1::text[]) FOR UPDATE",
       [normalizedPlayerIds]
     );
 
@@ -803,10 +907,19 @@ async function escrowRoomEntryFees(roomId, playerIds, entryFee) {
       throw new Error(`INSUFFICIENT_BALANCE:${insufficientPlayer}`);
     }
 
+    const currentRoundBonusEscrow = {};
     for (const playerId of normalizedPlayerIds) {
+      const playerRow = usersById.get(playerId);
+      const bonusUsed = Math.min(parseNumber(playerRow.non_withdrawable_balance), fee);
+      if (bonusUsed > 0) {
+        currentRoundBonusEscrow[playerId] = bonusUsed;
+      }
       await client.query(
-        "UPDATE users SET balance = balance - $2 WHERE telegram_id = $1",
-        [playerId, fee]
+        `UPDATE users
+        SET balance = balance - $2,
+          non_withdrawable_balance = GREATEST(0, non_withdrawable_balance - $3)
+        WHERE telegram_id = $1`,
+        [playerId, fee, bonusUsed]
       );
       await client.query(
         `INSERT INTO user_game_stats (user_id, amount_played)
@@ -844,6 +957,7 @@ async function escrowRoomEntryFees(roomId, playerIds, entryFee) {
       escrowSettled: false,
       escrowPlayers: [...new Set([...(roomStats.escrowPlayers || []), ...normalizedPlayerIds])],
       currentRoundPlayers: normalizedPlayerIds,
+      currentRoundBonusEscrow,
       currentRoundPot: roundPot,
       entryFee: fee,
       commissionRate: getCommissionRate(fee, roomStats.gamesPlayed),
@@ -942,6 +1056,7 @@ async function recordRoomGameResult(roomId, winnerId, playerIds, options = {}) {
     });
     roomStats.feeEscrowed = false;
     roomStats.currentRoundPlayers = [];
+    roomStats.currentRoundBonusEscrow = {};
     roomStats.currentRoundPot = 0;
     roomStats.escrowRefunded = false;
     roomStats.escrowSettled = false;
@@ -993,23 +1108,39 @@ async function finalizeRoomLedger(roomId, reason = "room-finalized") {
       ? roomStats.currentRoundPlayers
       : (roomStats.escrowPlayers.length ? roomStats.escrowPlayers : (room.players || []).map(String));
     const refundEntries = refundPlayerIds.map((playerId) => [playerId, roomStats.entryFee]);
+    const bonusRefundEntries = [];
 
     for (const [playerId, refundAmount] of refundEntries) {
+      const bonusRefundAmount = Math.min(
+        roundMoney(roomStats.currentRoundBonusEscrow?.[playerId] || 0),
+        roundMoney(refundAmount)
+      );
+      if (bonusRefundAmount > 0) {
+        bonusRefundEntries.push([playerId, bonusRefundAmount]);
+      }
       await client.query(
-        "UPDATE users SET balance = balance + $2 WHERE telegram_id = $1",
-        [playerId, refundAmount]
+        `UPDATE users
+        SET balance = balance + $2,
+          non_withdrawable_balance = LEAST(balance + $2, non_withdrawable_balance + $3)
+        WHERE telegram_id = $1`,
+        [playerId, refundAmount, bonusRefundAmount]
       );
     }
 
     roomStats.escrowRefunded = true;
     roomStats.feeEscrowed = false;
     roomStats.currentRoundPlayers = [];
+    roomStats.currentRoundBonusEscrow = {};
     roomStats.currentRoundPot = 0;
     roomStats.finalizedReason = reason;
     roomStats.finalizedAt = new Date().toISOString();
     roomStats.refunds = {
       ...(roomStats.refunds || {}),
       ...Object.fromEntries(refundEntries.map(([playerId, amount]) => [playerId, roundMoney(amount)])),
+    };
+    roomStats.bonusRefunds = {
+      ...(roomStats.bonusRefunds || {}),
+      ...Object.fromEntries(bonusRefundEntries.map(([playerId, amount]) => [playerId, roundMoney(amount)])),
     };
 
     await client.query("UPDATE rooms SET room_stats = $2 WHERE id = $1", [
@@ -1079,8 +1210,9 @@ async function addBalance(userId, amount) {
   );
 }
 
-async function withdrawBalance(userId, amount) {
+async function withdrawBalance(userId, amount, phone) {
   const coinAmount = roundMoney(amount);
+  const normalizedPhone = String(phone || "").trim().replace(/\s+/g, " ");
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
@@ -1092,19 +1224,28 @@ async function withdrawBalance(userId, amount) {
     if (!result.rows[0]) throw new Error("USER_NOT_FOUND");
 
     const user = mapUser(result.rows[0]);
-    if (user.balance < coinAmount) throw new Error("INSUFFICIENT_BALANCE");
+    if (user.withdrawableBalance < coinAmount) {
+      const error = new Error("INSUFFICIENT_WITHDRAWABLE_BALANCE");
+      error.withdrawableBalance = user.withdrawableBalance;
+      error.nonWithdrawableBalance = user.nonWithdrawableBalance;
+      throw error;
+    }
 
     const nextBalance = user.balance - coinAmount;
-    await client.query("UPDATE users SET balance = $2 WHERE telegram_id = $1", [
+    await client.query("UPDATE users SET balance = $2, phone = $3 WHERE telegram_id = $1", [
       String(userId),
       nextBalance,
+      normalizedPhone,
     ]);
     await client.query("COMMIT");
 
     return {
       currentBalance: user.balance,
+      withdrawableBalance: user.withdrawableBalance,
+      nonWithdrawableBalance: user.nonWithdrawableBalance,
       nextBalance,
-      phone: user.phone || "N/A",
+      nextWithdrawableBalance: Math.max(nextBalance - user.nonWithdrawableBalance, 0),
+      phone: normalizedPhone,
     };
   } catch (error) {
     await client.query("ROLLBACK");
@@ -1308,8 +1449,8 @@ async function awardReferralIfEligible(code, referredUserId) {
     }
 
     await client.query(
-      `INSERT INTO users (telegram_id, balance)
-      VALUES ($1, $2)
+      `INSERT INTO users (telegram_id, balance, non_withdrawable_balance)
+      VALUES ($1, $2, $2)
       ON CONFLICT (telegram_id) DO NOTHING`,
       [cleanReferredUserId, WELCOME_GIFT_COINS]
     );
@@ -1329,7 +1470,10 @@ async function awardReferralIfEligible(code, referredUserId) {
       [cleanCode, String(referralLink.user_id), cleanReferredUserId, REFERRAL_REWARD_COINS]
     );
     await client.query(
-      "UPDATE users SET balance = balance + $2 WHERE telegram_id = $1",
+      `UPDATE users
+      SET balance = balance + $2,
+        non_withdrawable_balance = non_withdrawable_balance + $2
+      WHERE telegram_id = $1`,
       [String(referralLink.user_id), REFERRAL_REWARD_COINS]
     );
     const updatedLink = await client.query(
@@ -1368,6 +1512,7 @@ module.exports = {
   createSyntheticBot,
   ensureSyntheticBotBalance,
   deleteSyntheticBot,
+  cleanupManagedBotUserForRoom,
   upsertUser,
   updateUserDisplayName,
   getPublicUsers,

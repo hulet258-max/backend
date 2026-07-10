@@ -5,6 +5,7 @@ const { redis } = require("../config/redis");
 const {
   createRoom,
   createSyntheticBot,
+  cleanupManagedBotUserForRoom,
   deleteRoom,
   deleteSyntheticBot,
   ensureUser,
@@ -292,6 +293,7 @@ const runBotTurn = async (req, roomId) => {
         redisData.roomStats = await recordRoomGameResult(roomId, botId, roundPlayers, {
           jokerBonus: false,
         });
+        await cleanupManagedBotUserForRoom(roomId);
         await emitBalanceUpdates(getIo(req), roundPlayers);
       }
       await emitBotState(req, roomId, redisData);
@@ -477,11 +479,18 @@ const cleanupManagedBotRoomForUser = async (io, userId) => {
 
 const fundManagedBotForRound = async (redisData, entryFee) => {
   if (!redisData?.managedBotRoom || !redisData.botProfile?.id) return null;
-  const botUser = await ensureSyntheticBotBalance(
+  let botUser = await ensureSyntheticBotBalance(
     redisData.botProfile.id,
     Number(entryFee || 0),
     randomInteger(40, 200)
   );
+  if (!botUser) {
+    botUser = await createSyntheticBot({
+      telegramId: redisData.botProfile.id,
+      displayName: redisData.botProfile.displayName || "Bot Player",
+      balance: Math.max(Number(entryFee || 0), randomInteger(40, 200)),
+    });
+  }
   if (!botUser) return null;
 
   redisData.botProfile = {

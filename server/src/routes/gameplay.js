@@ -3,6 +3,7 @@ const router = express.Router();
 const { redis } = require('../config/redis');
 const {
     escrowRoomEntryFees,
+    cleanupManagedBotUserForRoom,
     deleteRoom,
     getRoom,
     finalizeRoomLedger,
@@ -424,6 +425,7 @@ router.post('/gameplay/declare-win', async (req, res) => {
             redisData.roomStats = await recordRoomGameResult(roomId, userId, roundPlayers, {
                 jokerBonus: winAnalysis.jokerBonus,
             });
+            await cleanupManagedBotUserForRoom(roomId);
             await emitBalanceUpdates(req.app.get('io'), roundPlayers);
         }
         await redis.del("rooms:list");
@@ -594,6 +596,23 @@ router.post('/gameplay/leave-game', async (req, res) => {
 
         await removePlayerFromRoom(roomId, userId);
         await redis.del("rooms:list");
+
+        if (
+            redisData.managedBotRoom &&
+            remainingIds.length > 0 &&
+            remainingIds.every((id) => String(id).startsWith("botgamer:"))
+        ) {
+            redisData.roomStats = await finalizeRoomLedger(roomId, "managed-bot-human-left");
+            await deleteRoom(roomId, "managed-bot-human-left");
+            await redis.del(`room:${roomId}`);
+            const io = req.app.get('io');
+            await emitBalanceUpdates(io, getMoneyEventUserIds(redisData.roomStats));
+            if (io) {
+                io.emit("room_unavailable", { roomId });
+                io.emit("room_deleted", { roomId });
+            }
+            return res.status(200).json({ success: true, message: "Player left. Bot room removed.", redisData });
+        }
 
         if (remainingIds.length === 0) {
             redisData.roomStats = await finalizeRoomLedger(roomId, "all-players-left");
