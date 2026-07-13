@@ -1,10 +1,41 @@
 const express = require("express");
+const path = require("path");
+const fs = require("fs");
+const { randomUUID } = require("crypto");
+const multer = require("multer");
 const { query } = require("../config/postgres");
 const { redis } = require("../config/redis");
-const { deleteRoom, ensureAppSchema, finalizeRoomLedger, getRoom } = require("../db/store");
+const {
+  calculateCommissionAmount,
+  deleteRoom,
+  ensureAppSchema,
+  finalizeRoomLedger,
+  getCommissionRate,
+  getRoom,
+} = require("../db/store");
 const { emitBalanceUpdates } = require("../services/balanceEvents");
 
 const router = express.Router();
+const adminUploadDirectory = path.join(__dirname, "..", "..", "uploads", "admin");
+fs.mkdirSync(adminUploadDirectory, { recursive: true });
+const imageUpload = multer({
+  storage: multer.diskStorage({
+    destination: (_req, _file, callback) => callback(null, adminUploadDirectory),
+    filename: (_req, file, callback) => {
+      const extensionByType = {
+        "image/jpeg": ".jpg",
+        "image/png": ".png",
+        "image/webp": ".webp",
+        "image/gif": ".gif",
+      };
+      callback(null, `${randomUUID()}${extensionByType[file.mimetype] || ".img"}`);
+    },
+  }),
+  limits: { fileSize: 8 * 1024 * 1024, files: 1 },
+  fileFilter: (_req, file, callback) => callback(null, [
+    "image/jpeg", "image/png", "image/webp", "image/gif",
+  ].includes(file.mimetype)),
+});
 
 function parseNumber(value) {
   const parsed = Number(value);
@@ -33,26 +64,114 @@ function cleanImageUrl(value) {
   }
 }
 
+function cleanWebAppUrl(value) {
+  const url = cleanString(value, 1200);
+  if (!url) return "";
+  try {
+    const parsed = new URL(url);
+    const localHttp = parsed.protocol === "http:" && ["localhost", "127.0.0.1"].includes(parsed.hostname);
+    return parsed.protocol === "https:" || localHttp ? url : "";
+  } catch (error) {
+    return "";
+  }
+}
+
 function requireAdmin(req, res, next) {
   return next();
 }
 
-function normalizeRoomStats(stats = {}) {
+function formatCommissionRate(rate) {
+  const value = Number(rate || 0);
+  if (!Number.isFinite(value) || value <= 0) return "0%";
+  const percent = value * 100;
+  const fixed = percent.toFixed(2).replace(/\.?0+$/, "");
+  return `${fixed}%`;
+}
+
+function normalizeLastSettlement(settlement = null) {
+  if (!settlement || typeof settlement !== "object") return null;
+  const commissionRate = Number(settlement.commissionRate || 0);
   return {
-    gamesPlayed: Number(stats.gamesPlayed || 0),
+    round: Number(settlement.round || 0),
+    winnerId: settlement.winnerId ? String(settlement.winnerId) : null,
+    roundPot: parseNumber(settlement.roundPot),
+    commissionAmount: parseNumber(settlement.commissionAmount),
+    commissionRate,
+    commissionRateLabel: formatCommissionRate(commissionRate),
+    winnerPayout: parseNumber(settlement.winnerPayout),
+    settledAt: settlement.settledAt || null,
+  };
+}
+
+function normalizeGameRecord(game = {}, room = {}) {
+  const entryFee = parseNumber(game.entryFee ?? room.entryFee ?? room.roomStats?.entryFee);
+  const round = Number(game.round || 0);
+  const roundAmountToWin = parseNumber(game.roundAmountToWin);
+  const fallbackRate = getCommissionRate(entryFee, round || 1);
+  const commissionRate = Number(
+    game.commissionRate != null && Number.isFinite(Number(game.commissionRate))
+      ? game.commissionRate
+      : fallbackRate
+  );
+  let roundCommission = parseNumber(game.roundCommission);
+  // Backfill missing historical commission from pot + rate so admin always sees a cut.
+  if (roundCommission <= 0 && roundAmountToWin > 0) {
+    roundCommission = calculateCommissionAmount(roundAmountToWin, entryFee, round || 1);
+  }
+  let roundPayout = parseNumber(game.roundPayout);
+  if (roundPayout <= 0 && roundAmountToWin > 0) {
+    roundPayout = Math.max(roundAmountToWin - roundCommission, 0);
+  }
+
+  return {
+    round,
+    players: game.players || [],
+    winnerId: game.winnerId || "",
+    entryFee,
+    roundAmountToWin,
+    roundCommission,
+    commissionRate,
+    commissionRateLabel: formatCommissionRate(commissionRate),
+    roundPayout,
+    totalAmountToWin: parseNumber(game.totalAmountToWin),
+    jokerBonus: Boolean(game.jokerBonus),
+    winWeight: parseNumber(game.winWeight || 1),
+    completedAt: game.completedAt || null,
+  };
+}
+
+function normalizeRoomStats(stats = {}) {
+  const entryFee = parseNumber(stats.entryFee);
+  const gamesPlayed = Number(stats.gamesPlayed || 0);
+  const games = Array.isArray(stats.games)
+    ? stats.games.map((game) => normalizeGameRecord(game, { entryFee, roomStats: stats }))
+    : [];
+  const gamesCommissionTotal = games.reduce((sum, game) => sum + parseNumber(game.roundCommission), 0);
+  const storedCommission = parseNumber(stats.commissionAmount);
+  // Prefer stored cumulative house cut; fall back to sum of per-round cuts.
+  const commissionAmount = storedCommission > 0 ? storedCommission : gamesCommissionTotal;
+  const commissionRate = Number(
+    stats.commissionRate != null && Number.isFinite(Number(stats.commissionRate))
+      ? stats.commissionRate
+      : getCommissionRate(entryFee, gamesPlayed)
+  );
+
+  return {
+    gamesPlayed,
     winnerCounts: stats.winnerCounts || {},
     winnerWeights: stats.winnerWeights || {},
-    games: Array.isArray(stats.games) ? stats.games : [],
+    games,
     feeEscrowed: Boolean(stats.feeEscrowed),
     escrowRefunded: Boolean(stats.escrowRefunded),
     escrowSettled: Boolean(stats.escrowSettled),
     escrowPlayers: (stats.escrowPlayers || []).map(String),
     currentRoundPlayers: (stats.currentRoundPlayers || []).map(String),
     currentRoundPot: parseNumber(stats.currentRoundPot),
-    entryFee: parseNumber(stats.entryFee),
+    entryFee,
     totalPot: parseNumber(stats.totalPot),
-    commissionRate: parseNumber(stats.commissionRate),
-    commissionAmount: parseNumber(stats.commissionAmount),
+    commissionRate,
+    commissionRateLabel: formatCommissionRate(commissionRate),
+    commissionAmount,
     roundsEscrowed: Number(stats.roundsEscrowed || 0),
     playerFeesPaid: stats.playerFeesPaid || {},
     payouts: stats.payouts || {},
@@ -60,6 +179,7 @@ function normalizeRoomStats(stats = {}) {
     topWinnerIds: (stats.topWinnerIds || []).map(String),
     finalizedReason: stats.finalizedReason || null,
     finalizedAt: stats.finalizedAt || null,
+    lastSettlement: normalizeLastSettlement(stats.lastSettlement),
   };
 }
 
@@ -138,6 +258,8 @@ function mapAdminMessage(row) {
     id: Number(row.id),
     text: row.text || "",
     imageUrl: row.image_url || "",
+    buttonText: row.button_text || "",
+    webAppUrl: row.web_app_url || "",
     targetMode: row.target_mode || "filtered",
     targetCount: Number(row.target_count || 0),
     filters: row.filters || {},
@@ -150,23 +272,15 @@ function mapAdminMessage(row) {
 
 function flattenGames(rooms = []) {
   return rooms.flatMap((room) => (
-    room.roomStats.games.map((game) => ({
+    (room.roomStats.games || []).map((game) => ({
       roomId: room.id,
       roomName: room.name,
       roomStatus: room.status,
       lifecycle: room.lifecycle,
       archivedAt: room.archivedAt,
-      round: Number(game.round || 0),
-      players: game.players || [],
-      winnerId: game.winnerId || "",
-      entryFee: parseNumber(game.entryFee),
-      roundAmountToWin: parseNumber(game.roundAmountToWin),
-      roundCommission: parseNumber(game.roundCommission),
-      roundPayout: parseNumber(game.roundPayout),
-      totalAmountToWin: parseNumber(game.totalAmountToWin),
-      jokerBonus: Boolean(game.jokerBonus),
-      winWeight: parseNumber(game.winWeight || 1),
-      completedAt: game.completedAt || null,
+      entryFee: parseNumber(game.entryFee ?? room.entryFee),
+      roomCommissionTotal: parseNumber(room.roomStats.commissionAmount),
+      ...normalizeGameRecord(game, room),
     }))
   ));
 }
@@ -274,6 +388,14 @@ async function getDeposits() {
   }));
 }
 
+async function getDepositTotal(queryFn = query) {
+  const result = await queryFn(`
+    SELECT COALESCE(SUM(amount), 0) AS total
+    FROM transactions
+  `);
+  return parseNumber(result.rows[0]?.total);
+}
+
 async function getReferrals() {
   const result = await query(`
     SELECT
@@ -309,6 +431,65 @@ async function getReferrals() {
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   }));
+}
+
+async function getAnalyticsSummary() {
+  const [totalsResult, eventsResult, pagesResult, dailyResult, recentResult, referralResult] = await Promise.all([
+    query(`
+      SELECT
+        COUNT(DISTINCT session_id) FILTER (WHERE created_at >= NOW() - INTERVAL '24 hours') AS sessions_24h,
+        COUNT(DISTINCT session_id) FILTER (WHERE created_at >= NOW() - INTERVAL '5 minutes') AS live_visitors,
+        COUNT(*) FILTER (WHERE event_name IN ('page_view', 'game_view') AND created_at >= NOW() - INTERVAL '24 hours') AS page_views_24h,
+        COUNT(DISTINCT user_id) FILTER (WHERE user_id IS NOT NULL AND created_at >= NOW() - INTERVAL '24 hours') AS engaged_users_24h,
+        COUNT(*) FILTER (WHERE event_name = 'game_view' AND created_at >= NOW() - INTERVAL '24 hours') AS game_views_24h
+      FROM analytics_events
+    `),
+    query(`
+      SELECT event_name, COUNT(*) AS count
+      FROM analytics_events
+      WHERE created_at >= NOW() - INTERVAL '7 days'
+      GROUP BY event_name ORDER BY count DESC
+    `),
+    query(`
+      SELECT path, COUNT(*) AS views, COUNT(DISTINCT session_id) AS visitors
+      FROM analytics_events
+      WHERE event_name IN ('page_view', 'game_view') AND created_at >= NOW() - INTERVAL '7 days'
+      GROUP BY path ORDER BY views DESC LIMIT 8
+    `),
+    query(`
+      SELECT DATE_TRUNC('day', created_at)::date AS day, COUNT(DISTINCT session_id) AS sessions
+      FROM analytics_events
+      WHERE created_at >= NOW() - INTERVAL '30 days'
+      GROUP BY day ORDER BY day ASC
+    `),
+    query(`
+      SELECT ae.*, u.username, u.display_name, u.first_name
+      FROM analytics_events ae
+      LEFT JOIN users u ON u.telegram_id = ae.user_id
+      ORDER BY ae.created_at DESC LIMIT 20
+    `),
+    query(`SELECT COUNT(*) AS count FROM referral_awards WHERE created_at >= NOW() - INTERVAL '24 hours'`),
+  ]);
+  const totals = totalsResult.rows[0] || {};
+  return {
+    sessions24h: Number(totals.sessions_24h || 0),
+    liveVisitors: Number(totals.live_visitors || 0),
+    pageViews24h: Number(totals.page_views_24h || 0),
+    engagedUsers24h: Number(totals.engaged_users_24h || 0),
+    gameViews24h: Number(totals.game_views_24h || 0),
+    referralConversions24h: Number(referralResult.rows[0]?.count || 0),
+    eventBreakdown: eventsResult.rows.map((row) => ({ name: row.event_name, count: Number(row.count || 0) })),
+    topPages: pagesResult.rows.map((row) => ({ path: row.path, views: Number(row.views || 0), visitors: Number(row.visitors || 0) })),
+    dailyTraffic: dailyResult.rows.map((row) => ({ day: row.day, sessions: Number(row.sessions || 0) })),
+    recentEvents: recentResult.rows.map((row) => ({
+      id: Number(row.id),
+      eventName: row.event_name,
+      path: row.path,
+      userId: row.user_id ? String(row.user_id) : "",
+      userName: row.username || row.display_name || row.first_name || "Guest",
+      createdAt: row.created_at,
+    })),
+  };
 }
 
 async function getPosters(includeInactive = true) {
@@ -414,19 +595,27 @@ async function callTelegram(method, payload) {
   return data;
 }
 
-async function sendTelegramMessage(userId, { text, imageUrl }) {
+function buildWebAppReplyMarkup(buttonText, webAppUrl) {
+  if (!buttonText || !webAppUrl) return undefined;
+  return { inline_keyboard: [[{ text: buttonText, web_app: { url: webAppUrl } }]] };
+}
+
+async function sendTelegramMessage(userId, { text, imageUrl, buttonText, webAppUrl }) {
+  const replyMarkup = buildWebAppReplyMarkup(buttonText, webAppUrl);
   if (imageUrl) {
     const caption = text ? text.slice(0, 1024) : undefined;
     await callTelegram("sendPhoto", {
       chat_id: String(userId),
       photo: imageUrl,
       caption,
+      ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
     });
 
     if (text && text.length > 1024) {
       await callTelegram("sendMessage", {
         chat_id: String(userId),
         text,
+        ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
       });
     }
     return;
@@ -435,6 +624,7 @@ async function sendTelegramMessage(userId, { text, imageUrl }) {
   await callTelegram("sendMessage", {
     chat_id: String(userId),
     text,
+    ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
   });
 }
 
@@ -452,16 +642,21 @@ router.use(async (req, res, next) => {
 
 router.get("/overview", async (req, res) => {
   try {
-    const [users, rooms, deposits, referrals] = await Promise.all([
+    const [users, rooms, deposits, totalDeposits, referrals, analytics] = await Promise.all([
       getUsers(),
       getRooms(),
       getDeposits(),
+      getDepositTotal(),
       getReferrals(),
+      getAnalyticsSummary(),
     ]);
     const roomSummary = summarizeRooms(rooms);
     const totalBalance = users.reduce((sum, user) => sum + user.balance, 0);
-    const totalDeposits = deposits.reduce((sum, deposit) => sum + deposit.amount, 0);
     const totalReferralRewards = referrals.reduce((sum, referral) => sum + referral.totalAwarded, 0);
+    const activeRooms = rooms.filter((room) => !room.isArchived && room.status === "playing");
+    const now = Date.now();
+    const newUsers24h = users.filter((user) => now - new Date(user.createdAt).getTime() <= 24 * 60 * 60 * 1000).length;
+    const gamesToday = flattenGames(rooms).filter((game) => now - new Date(game.completedAt).getTime() <= 24 * 60 * 60 * 1000).length;
 
     return res.json({
       success: true,
@@ -473,6 +668,11 @@ router.get("/overview", async (req, res) => {
         withdrawalsTracked: false,
         totalReferralRewards,
         activeGames: roomSummary.playing,
+        activePlayers: activeRooms.reduce((sum, room) => sum + room.playerCount, 0),
+        waitingRooms: roomSummary.waiting,
+        newUsers24h,
+        gamesToday,
+        ...analytics,
         ...roomSummary,
       },
       recent: {
@@ -480,6 +680,14 @@ router.get("/overview", async (req, res) => {
         rooms: rooms.slice(0, 8),
         deposits: deposits.slice(0, 8),
         referrals: referrals.slice(0, 8),
+        activeGames: activeRooms.map((room) => ({
+          ...room,
+          playerNames: (room.players || []).map((playerId) => {
+            const player = users.find((user) => String(user.telegramId) === String(playerId));
+            return player?.username ? `@${player.username}` : player?.displayName || String(playerId);
+          }),
+        })),
+        analytics: analytics.recentEvents,
       },
     });
   } catch (error) {
@@ -611,12 +819,16 @@ router.delete("/rooms/:roomId", async (req, res) => {
 
 router.get("/money", async (req, res) => {
   try {
-    const [rooms, deposits] = await Promise.all([getRooms(), getDeposits()]);
+    const [rooms, deposits, totalDeposits] = await Promise.all([
+      getRooms(),
+      getDeposits(),
+      getDepositTotal(),
+    ]);
     const roomSummary = summarizeRooms(rooms);
     return res.json({
       success: true,
       money: {
-        totalDeposits: deposits.reduce((sum, deposit) => sum + deposit.amount, 0),
+        totalDeposits,
         totalWithdrawals: null,
         withdrawalsTracked: false,
         totalCommission: roomSummary.totalCommission,
@@ -663,11 +875,36 @@ router.get("/messages", async (req, res) => {
   }
 });
 
+router.post("/uploads/image", (req, res) => {
+  imageUpload.single("image")(req, res, (error) => {
+    if (error) {
+      const message = error.code === "LIMIT_FILE_SIZE"
+        ? "Image must be 8 MB or smaller."
+        : "Could not upload this image.";
+      return res.status(400).json({ success: false, error: message });
+    }
+    if (!req.file) {
+      return res.status(400).json({ success: false, error: "Select a JPG, PNG, WebP, or GIF image." });
+    }
+    const configuredOrigin = cleanString(process.env.API_PUBLIC_URL || process.env.PUBLIC_BASE_URL, 1200).replace(/\/$/, "");
+    const forwardedProtocol = cleanString(req.get("x-forwarded-proto"), 20).split(",")[0] || req.protocol;
+    const origin = configuredOrigin || `${forwardedProtocol}://${req.get("host")}`;
+    return res.status(201).json({
+      success: true,
+      imageUrl: `${origin}/uploads/admin/${encodeURIComponent(req.file.filename)}`,
+    });
+  });
+});
+
 router.post("/messages/send", async (req, res) => {
   try {
     const text = cleanString(req.body?.text, 4096);
     const rawImageUrl = cleanString(req.body?.imageUrl, 1200);
     const imageUrl = cleanImageUrl(rawImageUrl);
+    const wantsWebAppButton = req.body?.includeWebAppButton === true;
+    const rawWebAppUrl = cleanString(req.body?.webAppUrl || process.env.WEB_APP_URL, 1200);
+    const webAppUrl = wantsWebAppButton ? cleanWebAppUrl(rawWebAppUrl) : "";
+    const buttonText = wantsWebAppButton ? cleanString(req.body?.buttonText || "Play Carta", 64) : "";
     const mode = req.body?.mode === "selected" ? "selected" : "filtered";
     const filters = req.body?.filters && typeof req.body.filters === "object" ? req.body.filters : {};
 
@@ -676,6 +913,9 @@ router.post("/messages/send", async (req, res) => {
     }
     if (rawImageUrl && !imageUrl) {
       return res.status(400).json({ success: false, error: "Enter a valid http or https image URL." });
+    }
+    if (wantsWebAppButton && (!webAppUrl || !buttonText)) {
+      return res.status(400).json({ success: false, error: "Enter a valid HTTPS Web App URL and button text." });
     }
     if (!process.env.BOT_TOKEN) {
       return res.status(400).json({ success: false, error: "BOT_TOKEN is not configured." });
@@ -692,10 +932,10 @@ router.post("/messages/send", async (req, res) => {
     }
 
     const messageResult = await query(
-      `INSERT INTO admin_messages (text, image_url, target_mode, target_count, filters)
-      VALUES ($1, $2, $3, $4, $5::jsonb)
+      `INSERT INTO admin_messages (text, image_url, button_text, web_app_url, target_mode, target_count, filters)
+      VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
       RETURNING *`,
-      [text, imageUrl, mode, recipients.length, JSON.stringify(filters)]
+      [text, imageUrl, buttonText, webAppUrl, mode, recipients.length, JSON.stringify(filters)]
     );
     const message = messageResult.rows[0];
     const deliveryResults = [];
@@ -705,7 +945,7 @@ router.post("/messages/send", async (req, res) => {
       let deliveryError = "";
 
       try {
-        await sendTelegramMessage(user.telegramId, { text, imageUrl });
+        await sendTelegramMessage(user.telegramId, { text, imageUrl, buttonText, webAppUrl });
       } catch (error) {
         status = "failed";
         deliveryError = cleanString(error.message, 500);
@@ -913,3 +1153,14 @@ router.delete("/deposit-numbers/:id", async (req, res) => {
 });
 
 module.exports = router;
+module.exports.testUtils = {
+  flattenGames,
+  getDepositTotal,
+  mapAdminMessage,
+  mapDepositNumber,
+  mapPoster,
+  mapRoom,
+  mapUser,
+  normalizeGameRecord,
+  summarizeRooms,
+};

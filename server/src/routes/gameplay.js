@@ -12,7 +12,13 @@ const {
     updateRoomStatus,
 } = require("../db/store");
 const { createInitialGameState } = require("../services/gameService");
-const { emitBalanceUpdates } = require("../services/balanceEvents");
+const { buildSocketByUserId, emitBalanceUpdates } = require("../services/balanceEvents");
+const {
+    buildRoomUpdatePayload,
+    sanitizeGameResult,
+    sanitizeRedisData,
+    sanitizeRoom,
+} = require("../services/playerPayload");
 const {
     biasBotInitialHand,
     fundManagedBotForRound,
@@ -26,6 +32,18 @@ const getMoneyEventUserIds = (roomStats = {}) => [
     ...Object.keys(roomStats.payouts || {}),
     ...Object.keys(roomStats.refunds || {}),
 ];
+
+const acquireRoomActionLock = async (roomId, action, ttlSeconds = 8) => {
+    const key = `room:${roomId}:${action}-lock`;
+    const token = `${Date.now()}-${Math.random()}`;
+    const result = await redis.set(key, token, { NX: true, EX: ttlSeconds });
+    return result === "OK" ? { key, token } : null;
+};
+
+const releaseRoomActionLock = async (lock) => {
+    if (!lock?.key) return;
+    await redis.del(lock.key);
+};
 
 // Helper to fetch current room state from Redis
 const getRoomState = async (roomId) => {
@@ -191,7 +209,9 @@ const saveAndEmitState = async (req, roomId, redisData, currentUserId, currentUs
     if (currentUserId && currentUserSocketId && redisData.players) {
         const playerIndex = redisData.players.findIndex(p => String(p.telegramId) === String(currentUserId));
         if (playerIndex !== -1 && redisData.players[playerIndex].socketId !== currentUserSocketId) {
-            console.log(`🔌 Updating socketId for active player ${currentUserId} from ${redisData.players[playerIndex].socketId} to ${currentUserSocketId}`);
+            if (process.env.DEBUG_GAME_EVENTS === "true") {
+                console.log(`Updating socketId for active player ${currentUserId} from ${redisData.players[playerIndex].socketId} to ${currentUserSocketId}`);
+            }
             redisData.players[playerIndex].socketId = currentUserSocketId;
         }
     }
@@ -208,16 +228,16 @@ const saveAndEmitState = async (req, roomId, redisData, currentUserId, currentUs
             return;
         }
 
-        const payload = {
-            room: roomData,
-            players: roomData.players, // The simple array of IDs from Postgres
-            redisData: redisData,
-        };
+        const payload = buildRoomUpdatePayload(roomData, redisData);
 
-        console.log(`📢 Emitting 'room_update' to players in room ${roomId} after gameplay action.`);
+        if (process.env.DEBUG_GAME_EVENTS === "true") {
+            console.log(`Emitting room_update to players in room ${roomId} after gameplay action.`);
+        }
         redisData.players.forEach((p) => {
             if (p.socketId) {
-                console.log(`  -> Emitting to user ${p.telegramId} via socket: ${p.socketId}`);
+                if (process.env.DEBUG_GAME_EVENTS === "true") {
+                    console.log(`Emitting to user ${p.telegramId} via socket: ${p.socketId}`);
+                }
                 io.to(p.socketId).emit("room_update", payload);
             } else {
                 console.warn(`  -> No socketId found for user ${p.telegramId} in room ${roomId}. Cannot emit update.`);
@@ -265,7 +285,7 @@ router.post('/gameplay/take-card', async (req, res) => {
         };
 
         await saveAndEmitState(req, roomId, redisData, userId, socketId);
-        res.status(200).json({ success: true, message: 'Card taken from deck', pickedCard: card, source: "deck", redisData });
+        res.status(200).json({ success: true, message: 'Card taken from deck', pickedCard: card, source: "deck", redisData: sanitizeRedisData(redisData) });
 
     } catch (error) {
         console.error('Take card error:', error);
@@ -317,7 +337,7 @@ router.post('/gameplay/pick-card', async (req, res) => {
         };
 
         await saveAndEmitState(req, roomId, redisData, userId, socketId);
-        res.status(200).json({ success: true, message: 'Picked from laid cards', pickedCard: card, source: "laid", redisData });
+        res.status(200).json({ success: true, message: 'Picked from laid cards', pickedCard: card, source: "laid", redisData: sanitizeRedisData(redisData) });
 
     } catch (error) {
         console.error('Pick card error:', error);
@@ -383,7 +403,7 @@ router.post('/gameplay/lay-card', async (req, res) => {
         if (isBotGameState(redisData)) {
             scheduleBotTurn(req, roomId);
         }
-        res.status(200).json({ success: true, message: 'Card laid and turn passed', redisData });
+        res.status(200).json({ success: true, message: 'Card laid and turn passed', redisData: sanitizeRedisData(redisData) });
 
     } catch (error) {
         console.error('Lay card error:', error);
@@ -392,6 +412,7 @@ router.post('/gameplay/lay-card', async (req, res) => {
 });
 
 router.post('/gameplay/declare-win', async (req, res) => {
+    let lock = null;
     try {
         const { userId, roomId, socketId } = req.body;
         const redisData = await getRoomState(roomId);
@@ -406,6 +427,11 @@ router.post('/gameplay/declare-win', async (req, res) => {
         const winAnalysis = analyzeWinningHand(userHand);
         if (!winAnalysis.isWinning) {
             return res.status(400).json({ error: "Invalid winning hand. Need 4-3-3-1 same ranks. Jokers can complete a missing rank group." });
+        }
+
+        lock = await acquireRoomActionLock(roomId, "declare-win", 30);
+        if (!lock) {
+            return res.status(409).json({ error: "Win declaration is already being processed." });
         }
 
         redisData.status = "ended";
@@ -425,8 +451,27 @@ router.post('/gameplay/declare-win', async (req, res) => {
             redisData.roomStats = await recordRoomGameResult(roomId, userId, roundPlayers, {
                 jokerBonus: winAnalysis.jokerBonus,
             });
+            const settlement = redisData.roomStats?.lastSettlement || null;
+            if (settlement) {
+                redisData.gameResult = {
+                    ...redisData.gameResult,
+                    roundPot: settlement.roundPot,
+                    roundPayout: settlement.winnerPayout,
+                    winnerId: settlement.winnerId || userId,
+                };
+            }
             await cleanupManagedBotUserForRoom(roomId);
-            await emitBalanceUpdates(req.app.get('io'), roundPlayers);
+            console.log("[settlement] round settled", {
+                roomId,
+                winnerId: userId,
+                roundPot: settlement?.roundPot,
+                winnerPayout: settlement?.winnerPayout,
+                commissionAmount: settlement?.commissionAmount,
+            });
+            await emitBalanceUpdates(req.app.get('io'), roundPlayers, {
+                socketByUserId: buildSocketByUserId(redisData.players),
+                settlement,
+            });
         }
         await redis.del("rooms:list");
         await saveAndEmitState(req, roomId, redisData, userId, socketId);
@@ -434,16 +479,18 @@ router.post('/gameplay/declare-win', async (req, res) => {
         return res.status(200).json({
             success: true,
             message: "Winner declared. Game ended.",
-            gameResult: redisData.gameResult,
-            redisData
+            gameResult: sanitizeGameResult(redisData.gameResult),
+            redisData: sanitizeRedisData(redisData)
         });
     } catch (error) {
+        await releaseRoomActionLock(lock);
         console.error('Declare win error:', error);
         return res.status(500).json({ error: 'Internal server error' });
     }
 });
 
 router.post('/gameplay/play-again', async (req, res) => {
+    let lock = null;
     try {
         const { userId, roomId, socketId } = req.body;
         const redisData = await getRoomState(roomId);
@@ -457,6 +504,11 @@ router.post('/gameplay/play-again', async (req, res) => {
         const roomData = await getRoom(roomId);
         if (!roomData) return res.status(404).json({ error: 'Room not found' });
 
+        lock = await acquireRoomActionLock(roomId, "play-again", 8);
+        if (!lock) {
+            return res.status(409).json({ error: "A new round is already being started." });
+        }
+
         if (isPracticeState(redisData)) {
             redisData.roomStats = {
                 ...(redisData.roomStats || {}),
@@ -468,7 +520,6 @@ router.post('/gameplay/play-again', async (req, res) => {
                 entryFee: 0,
                 totalPot: 0,
                 currentRoundPot: 0,
-                commissionAmount: 0,
             };
         } else {
             await fundManagedBotForRound(redisData, roomData.entryFee);
@@ -482,6 +533,8 @@ router.post('/gameplay/play-again', async (req, res) => {
                 const message = insufficientPlayerId
                     ? "A player does not have enough balance to continue this room."
                     : error.message || "Could not collect entry fees for the next game.";
+                await releaseRoomActionLock(lock);
+                lock = null;
                 return res.status(400).json({
                     error: message,
                     code: insufficientPlayerId ? "INSUFFICIENT_BALANCE" : "ROOM_ESCROW_FAILED",
@@ -490,7 +543,14 @@ router.post('/gameplay/play-again', async (req, res) => {
                     entryFee: roomData.entryFee,
                 });
             }
-            await emitBalanceUpdates(req.app.get('io'), playerIds);
+            console.log("[settlement] next round escrowed", {
+                roomId,
+                playerIds,
+                entryFee: roomData.entryFee,
+            });
+            await emitBalanceUpdates(req.app.get('io'), playerIds, {
+                socketByUserId: buildSocketByUserId(redisData.players),
+            });
         }
 
         const nextGameState = createInitialGameState(playerIds);
@@ -520,9 +580,10 @@ router.post('/gameplay/play-again', async (req, res) => {
         return res.status(200).json({
             success: true,
             message: "New round started.",
-            redisData
+            redisData: sanitizeRedisData(redisData)
         });
     } catch (error) {
+        await releaseRoomActionLock(lock);
         console.error('Play again error:', error);
         return res.status(500).json({ error: 'Internal server error' });
     }
@@ -546,7 +607,7 @@ router.post('/gameplay/leave-game', async (req, res) => {
                 io.emit("room_unavailable", { roomId });
                 io.emit("room_deleted", { roomId });
             }
-            return res.status(200).json({ success: true, message: "Practice game ended.", redisData });
+            return res.status(200).json({ success: true, message: "Practice game ended.", redisData: sanitizeRedisData(redisData) });
         }
 
         const beforeIds = (redisData.players || []).map((p) => String(p.telegramId));
@@ -569,7 +630,7 @@ router.post('/gameplay/leave-game', async (req, res) => {
             return res.status(200).json({
                 success: true,
                 message: "Returned to lobby. Room was kept open.",
-                redisData
+                redisData: sanitizeRedisData(redisData)
             });
         }
 
@@ -581,7 +642,7 @@ router.post('/gameplay/leave-game', async (req, res) => {
             return res.status(200).json({
                 success: true,
                 message: "Returned to lobby. Active game was kept.",
-                redisData
+                redisData: sanitizeRedisData(redisData)
             });
         }
 
@@ -606,12 +667,14 @@ router.post('/gameplay/leave-game', async (req, res) => {
             await deleteRoom(roomId, "managed-bot-human-left");
             await redis.del(`room:${roomId}`);
             const io = req.app.get('io');
-            await emitBalanceUpdates(io, getMoneyEventUserIds(redisData.roomStats));
+            await emitBalanceUpdates(io, getMoneyEventUserIds(redisData.roomStats), {
+                socketByUserId: buildSocketByUserId(redisData.players),
+            });
             if (io) {
                 io.emit("room_unavailable", { roomId });
                 io.emit("room_deleted", { roomId });
             }
-            return res.status(200).json({ success: true, message: "Player left. Bot room removed.", redisData });
+            return res.status(200).json({ success: true, message: "Player left. Bot room removed.", redisData: sanitizeRedisData(redisData) });
         }
 
         if (remainingIds.length === 0) {
@@ -619,17 +682,21 @@ router.post('/gameplay/leave-game', async (req, res) => {
             await deleteRoom(roomId, "all-players-left");
             await redis.del(`room:${roomId}`);
             const io = req.app.get('io');
-            await emitBalanceUpdates(io, getMoneyEventUserIds(redisData.roomStats));
+            await emitBalanceUpdates(io, getMoneyEventUserIds(redisData.roomStats), {
+                socketByUserId: buildSocketByUserId(redisData.players),
+            });
             if (io) {
                 io.emit("room_unavailable", { roomId });
                 io.emit("room_deleted", { roomId });
             }
-            return res.status(200).json({ success: true, message: "Player left. Room is now empty.", redisData });
+            return res.status(200).json({ success: true, message: "Player left. Room is now empty.", redisData: sanitizeRedisData(redisData) });
         }
 
         if (redisData.gameEnded || redisData.status === "ended") {
             redisData.roomStats = await finalizeRoomLedger(roomId, "game-ended-player-left");
-            await emitBalanceUpdates(req.app.get('io'), getMoneyEventUserIds(redisData.roomStats));
+            await emitBalanceUpdates(req.app.get('io'), getMoneyEventUserIds(redisData.roomStats), {
+                socketByUserId: buildSocketByUserId(redisData.players),
+            });
             resetRoomToWaiting(redisData);
             await updateRoomStatus(roomId, "waiting");
             await redis.del("rooms:list");
@@ -637,7 +704,9 @@ router.post('/gameplay/leave-game', async (req, res) => {
 
         if (!redisData.gameEnded && redisData.status === "playing") {
             redisData.roomStats = await finalizeRoomLedger(roomId, "active-round-abandoned");
-            await emitBalanceUpdates(req.app.get('io'), getMoneyEventUserIds(redisData.roomStats));
+            await emitBalanceUpdates(req.app.get('io'), getMoneyEventUserIds(redisData.roomStats), {
+                socketByUserId: buildSocketByUserId(redisData.players),
+            });
             resetRoomToWaiting(redisData);
             await updateRoomStatus(roomId, "waiting");
             await redis.del("rooms:list");
@@ -647,9 +716,9 @@ router.post('/gameplay/leave-game', async (req, res) => {
         const io = req.app.get('io');
         if (io) {
             const roomData = await getRoom(roomId);
-            if (roomData) io.emit("new_room_created", roomData);
+            if (roomData) io.emit("new_room_created", sanitizeRoom(roomData));
         }
-        return res.status(200).json({ success: true, message: "Player left game.", redisData });
+        return res.status(200).json({ success: true, message: "Player left game.", redisData: sanitizeRedisData(redisData) });
     } catch (error) {
         console.error('Leave game error:', error);
         return res.status(500).json({ error: 'Internal server error' });
@@ -686,14 +755,16 @@ router.post('/gameplay/continue-after-leave', async (req, res) => {
             moveTurnIfNeeded(redisData, null, getPlayerIds(redisData).map(String));
         } else if (allVoted && (!allContinue || requiredIds.length < 2)) {
             redisData.roomStats = await finalizeRoomLedger(roomId, "active-round-abandoned");
-            await emitBalanceUpdates(req.app.get('io'), getMoneyEventUserIds(redisData.roomStats));
+            await emitBalanceUpdates(req.app.get('io'), getMoneyEventUserIds(redisData.roomStats), {
+                socketByUserId: buildSocketByUserId(redisData.players),
+            });
             resetRoomToWaiting(redisData);
             await updateRoomStatus(roomId, "waiting");
             await redis.del("rooms:list");
         }
 
         await saveAndEmitState(req, roomId, redisData, userId, socketId);
-        return res.status(200).json({ success: true, redisData });
+        return res.status(200).json({ success: true, redisData: sanitizeRedisData(redisData) });
     } catch (error) {
         console.error('Continue after leave error:', error);
         return res.status(500).json({ error: 'Internal server error' });

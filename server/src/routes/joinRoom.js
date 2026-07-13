@@ -9,7 +9,8 @@ const {
   removePlayerFromRoom,
   updateRoomStatus,
 } = require("../db/store");
-const { emitBalanceUpdates } = require("../services/balanceEvents");
+const { buildSocketByUserId, emitBalanceUpdates } = require("../services/balanceEvents");
+const { buildRoomUpdatePayload, sanitizeRedisData, sanitizeRoom } = require("../services/playerPayload");
 const {
   biasBotInitialHand,
   isBotGameState,
@@ -45,7 +46,7 @@ router.post("/join-room", async (req, res) => {
           : "Leave your current room before joining a new room.",
         alreadyInRoom: true,
         mustDeleteOwnRoom: ownsActiveRoom,
-        room: activeRoom,
+        room: sanitizeRoom(activeRoom),
       });
     }
 
@@ -89,7 +90,9 @@ router.post("/join-room", async (req, res) => {
                       : error.message || "Could not collect room entry fees.";
                     return res.status(400).json({ success: false, error: message });
                   }
-                  await emitBalanceUpdates(req.app.get("io"), roomData.players);
+                  await emitBalanceUpdates(req.app.get("io"), roomData.players, {
+                    socketByUserId: buildSocketByUserId(redisData.players),
+                  });
                   roomData = await updateRoomStatus(roomId, "playing");
                   const initialGameState = createInitialGameState(roomData.players);
                   if (redisData.managedBotRoom) {
@@ -112,11 +115,7 @@ router.post("/join-room", async (req, res) => {
               }
               const io = req.app.get("io");
               if (io) {
-                const payload = {
-                  room: { id: roomId, ...roomData },
-                  players: roomData.players,
-                  redisData,
-                };
+                const payload = buildRoomUpdatePayload({ id: roomId, ...roomData }, redisData);
                 redisData.players.forEach((p) => {
                   if (p.socketId) io.to(p.socketId).emit("room_update", payload);
                 });
@@ -129,9 +128,9 @@ router.post("/join-room", async (req, res) => {
 
       return res.json({
         success: true,
-        room: { id: roomId, ...roomData },
+        room: sanitizeRoom({ id: roomId, ...roomData }),
         players: roomData.players,
-        redisData,
+        redisData: sanitizeRedisData(redisData),
       });
     }
 
@@ -177,7 +176,9 @@ router.post("/join-room", async (req, res) => {
             : error.message || "Could not collect room entry fees.";
           return res.status(400).json({ success: false, error: message });
         }
-        await emitBalanceUpdates(req.app.get("io"), updatedRoom.players);
+        await emitBalanceUpdates(req.app.get("io"), updatedRoom.players, {
+          socketByUserId: buildSocketByUserId(redisData.players),
+        });
 
         updatedRoom = await updateRoomStatus(roomId, "playing");
         
@@ -212,11 +213,7 @@ router.post("/join-room", async (req, res) => {
       // Note: Assumes `io` is attached to `req` via middleware, e.g., `req.app.get('io')`.
       const io = req.app.get("io");
       if (io && redisData.players) {
-        const payload = {
-          room: { id: roomId, ...updatedRoom },
-          players: updatedRoom.players,
-          redisData: redisData,
-        };
+        const payload = buildRoomUpdatePayload({ id: roomId, ...updatedRoom }, redisData);
         if (updatedRoom.playerCount >= updatedRoom.maxPlayers) {
           io.emit("room_unavailable", { roomId });
           reconcileConnectedUsers(io).catch((error) => {
@@ -241,9 +238,9 @@ router.post("/join-room", async (req, res) => {
 
     res.json({
       success: true,
-      room: { id: roomId, ...updatedRoom },
+      room: sanitizeRoom({ id: roomId, ...updatedRoom }),
       players: updatedRoom.players || [],
-      redisData // Will now contain turn, playerCards, deck, and laidCards if the room filled up
+      redisData: sanitizeRedisData(redisData) // Will now contain turn, playerCards, deck, and laidCards if the room filled up
     });
 
   } catch (err) {

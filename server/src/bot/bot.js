@@ -1,7 +1,6 @@
 // server/src/bot/bot.js
 
 const { Telegraf } = require('telegraf');
-const { COIN_BIRR_VALUE } = require("../config/economy");
 const { ensureUser, getReferralLink, getRoom } = require("../db/store");
 
 const GAME_INTRO = [
@@ -14,6 +13,7 @@ const GAME_INTRO = [
   "4. When your hand is ready, tap Win to declare it.",
   "",
   "Public and private rooms use Birr; practice games are free.",
+   "for any support, contact @carta_support ",
 ].join("\n");
 
 function buildWebAppUrl(referralCode = "") {
@@ -96,7 +96,7 @@ function buildRoomInlineResult(room, roomUrl, fallbackUrl = "", useWebApp = true
   const roomName = room.name || "Private room";
   const playerCount = Number(room.playerCount || 0);
   const maxPlayers = Number(room.maxPlayers || 0);
-  const entryFee = Number(room.entryFee || 0) * COIN_BIRR_VALUE;
+  const entryFee = Number(room.entryFee || 0);
 
   return {
     type: "article",
@@ -187,7 +187,11 @@ function createBot() {
   bot.start(async (ctx) => {
     const webAppUrl = buildWebAppUrl(ctx.startPayload);
     try {
-      await ensureUser(ctx.from.id);
+      await ensureUser(ctx.from.id, {
+        username: ctx.from.username,
+        firstName: ctx.from.first_name,
+        lastName: ctx.from.last_name,
+      });
     } catch (err) {
       console.error('Bot start user sync error:', err);
     }
@@ -265,7 +269,7 @@ function createBot() {
     try {
       const userId = String(ctx.match?.[1] || "").trim();
       const amount = Number(ctx.match?.[2] || 0);
-      const birrAmount = amount * COIN_BIRR_VALUE;
+      const birrAmount = amount;
 
       if (userId) {
         await ctx.telegram.sendMessage(
@@ -314,11 +318,7 @@ function createBot() {
  * Start bot safely
  */
 async function startBot(bot) {
-  console.log(' Bot started');
   console.log('🤖 Bot started');
-
-  process.once('SIGINT', () => bot.stop('SIGINT'));
-  process.once('SIGTERM', () => bot.stop('SIGTERM'));
 
   await bot.launch();
 }

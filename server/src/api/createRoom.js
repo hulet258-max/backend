@@ -1,9 +1,9 @@
 const express = require("express");
 const router = express.Router();
 const {
-  MIN_ROOM_ENTRY_COINS,
-  COIN_BIRR_VALUE,
-  isWholeCoinAmount,
+  MIN_ROOM_ENTRY_BIRR,
+  ROOM_ENTRY_STEP_BIRR,
+  isValidRoomEntryBirr,
 } = require("../config/economy");
 const { redis } = require("../config/redis"); // import redis client
 const {
@@ -18,6 +18,7 @@ const {
   listPublicRooms,
 } = require("../db/store");
 const { emitBalanceUpdates } = require("../services/balanceEvents");
+const { sanitizeRoom } = require("../services/playerPayload");
 
 // Helper to determine max players from game type
 const getMaxPlayers = (gameType) => {
@@ -47,11 +48,11 @@ router.post("/create-room", async (req, res) => {
       return res.status(400).json({ success: false, error: "Game type must be 2, 3, or 4 players." });
     }
 
-    const entryFeeCoins = Number(entryFee);
-    if (!isWholeCoinAmount(entryFeeCoins) || entryFeeCoins < MIN_ROOM_ENTRY_COINS) {
+    const entryFeeBirr = Number(entryFee);
+    if (!isValidRoomEntryBirr(entryFeeBirr)) {
       return res.status(400).json({
         success: false,
-        error: `Entry fee must be at least ${MIN_ROOM_ENTRY_COINS * COIN_BIRR_VALUE} Birr.`,
+        error: `Entry fee must be at least ${MIN_ROOM_ENTRY_BIRR} Birr and a multiple of ${ROOM_ENTRY_STEP_BIRR} Birr.`,
       });
     }
 
@@ -61,7 +62,7 @@ router.post("/create-room", async (req, res) => {
       return res.status(404).json({ success: false, error: "Creator not found" });
     }
 
-    if (Number(creator.balance || 0) < entryFeeCoins) {
+    if (Number(creator.balance || 0) < entryFeeBirr) {
       return res.status(400).json({
         success: false,
         error: "Insufficient Birr balance to create this room.",
@@ -75,7 +76,7 @@ router.post("/create-room", async (req, res) => {
         error: "Delete your room before creating a new room.",
         alreadyInRoom: true,
         mustDeleteOwnRoom: true,
-        room: creatorActiveRoom,
+        room: sanitizeRoom(creatorActiveRoom),
       });
     }
 
@@ -85,7 +86,7 @@ router.post("/create-room", async (req, res) => {
         success: false,
         error: "Leave your current room before creating a new room.",
         alreadyInRoom: true,
-        room: activeRoom,
+        room: sanitizeRoom(activeRoom),
       });
     }
 
@@ -104,8 +105,8 @@ router.post("/create-room", async (req, res) => {
     const newRoom = {
       name: roomName,
       type: gameType,
-      entryFee: entryFeeCoins,
-      stake: entryFeeCoins,
+      entryFee: entryFeeBirr,
+      stake: entryFeeBirr,
       creatorId: creatorId,
       visibility: normalizedVisibility,
       players: [creatorId], // Keep Postgres room state simple (just Telegram IDs)
@@ -125,7 +126,7 @@ router.post("/create-room", async (req, res) => {
 
     const io = req.app.get("io");
     if (io) {
-      io.emit("new_room_created", roomData);
+      io.emit("new_room_created", sanitizeRoom(roomData));
     }
 
     // 3. Create Redis entry with Telegram ID & Socket ID side-by-side
@@ -155,7 +156,7 @@ router.post("/create-room", async (req, res) => {
       }
     }
 
-    res.status(201).json({ success: true, room: roomData });
+    res.status(201).json({ success: true, room: sanitizeRoom(roomData) });
 
   } catch (err) {
     console.error(" /api/create-room error:", err);
@@ -169,7 +170,7 @@ router.get("/rooms", async (req, res) => {
 
     if (userId) {
       const rooms = await listLobbyRooms(userId);
-      return res.json({ success: true, rooms });
+      return res.json({ success: true, rooms: rooms.map(sanitizeRoom) });
     }
 
     // 1. Check Redis cache first
@@ -177,7 +178,7 @@ router.get("/rooms", async (req, res) => {
 
     if (cachedRooms) {
       console.log(" Rooms loaded from Redis");
-      return res.json({ success: true, rooms: JSON.parse(cachedRooms) });
+      return res.json({ success: true, rooms: JSON.parse(cachedRooms).map(sanitizeRoom) });
     }
 
     // 2. If not in cache, fetch from Postgres.
@@ -190,7 +191,7 @@ router.get("/rooms", async (req, res) => {
 
     console.log(" Rooms cached in Redis");
 
-    res.json({ success: true, rooms });
+    res.json({ success: true, rooms: rooms.map(sanitizeRoom) });
 
   } catch (err) {
     console.error(" /api/rooms error:", err);
@@ -207,7 +208,7 @@ router.get("/room/:roomId", async (req, res) => {
       return res.status(404).json({ success: false, error: "Room not found" });
     }
 
-    return res.json({ success: true, room });
+    return res.json({ success: true, room: sanitizeRoom(room) });
   } catch (err) {
     console.error(" /api/room/:roomId error:", err);
     return res.status(500).json({ success: false, error: "Server error" });

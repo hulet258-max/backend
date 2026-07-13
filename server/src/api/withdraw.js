@@ -1,11 +1,14 @@
 const express = require("express");
 const { Telegram } = require("telegraf");
 const {
-  COIN_BIRR_VALUE,
-  MIN_WITHDRAW_COINS,
-  isWholeCoinAmount,
+  MIN_WITHDRAW_BIRR,
+  isWholeBirrAmount,
 } = require("../config/economy");
 const { withdrawBalance } = require("../db/store");
+const {
+  WITHDRAWAL_WAIT_DAYS,
+  splitRemainingWithdrawalTime,
+} = require("../services/withdrawalPolicy");
 
 const router = express.Router();
 
@@ -17,13 +20,14 @@ function toNumber(value) {
 }
 
 function normalizePhone(value) {
-  return String(value || "").trim().replace(/\s+/g, " ");
+  const compact = String(value || "").trim().replace(/[\s-]/g, "");
+  if (/^0[79]\d{8}$/.test(compact)) return `+251${compact.slice(1)}`;
+  if (/^251[79]\d{8}$/.test(compact)) return `+${compact}`;
+  return compact;
 }
 
 function isValidPhoneNumber(value) {
-  const phone = normalizePhone(value);
-  const digits = phone.replace(/\D/g, "");
-  return /^\+?[0-9\s\-()]+$/.test(phone) && digits.length >= 9 && digits.length <= 15;
+  return /^\+251[79]\d{8}$/.test(normalizePhone(value));
 }
 
 router.post("/withdraw", async (req, res) => {
@@ -41,15 +45,15 @@ router.post("/withdraw", async (req, res) => {
     if (!isValidPhoneNumber(phone)) {
       return res.status(400).json({
         success: false,
-        error: "Enter a valid phone number.",
+        error: "Enter a valid Ethiopian phone number (09/07 or +251 format).",
       });
     }
 
     const withdrawAmount = toNumber(amount);
-    if (!isWholeCoinAmount(withdrawAmount) || withdrawAmount < MIN_WITHDRAW_COINS) {
+    if (!isWholeBirrAmount(withdrawAmount) || withdrawAmount < MIN_WITHDRAW_BIRR) {
       return res.status(400).json({
         success: false,
-        error: `amount must be at least ${MIN_WITHDRAW_COINS * COIN_BIRR_VALUE} Birr.`,
+        error: `amount must be at least ${MIN_WITHDRAW_BIRR} Birr.`,
       });
     }
 
@@ -61,8 +65,8 @@ router.post("/withdraw", async (req, res) => {
         "💸 New Withdraw Request",
         `User Telegram ID: ${telegramId}`,
         `Phone: ${result.phone}`,
-        `Withdraw Amount: ${withdrawAmount * COIN_BIRR_VALUE} Birr`,
-        `Balance After: ${result.nextBalance * COIN_BIRR_VALUE} Birr`,
+        `Withdraw Amount: ${withdrawAmount} Birr`,
+        `Balance After: ${result.nextBalance} Birr`,
       ].join("\n");
 
       await telegram.sendMessage(ADMIN_TELEGRAM_ID, message, {
@@ -88,7 +92,7 @@ router.post("/withdraw", async (req, res) => {
       newWithdrawableBalance: result.nextWithdrawableBalance,
       phone: result.phone,
       limits: {
-        minWithdraw: MIN_WITHDRAW_COINS,
+        minWithdraw: MIN_WITHDRAW_BIRR,
         maxWithdraw: result.nextWithdrawableBalance,
       },
     });
@@ -97,6 +101,25 @@ router.post("/withdraw", async (req, res) => {
       return res.status(404).json({
         success: false,
         error: "User not found.",
+      });
+    }
+
+    if (error.message === "WITHDRAWAL_ACCOUNT_TOO_NEW") {
+      const remaining = splitRemainingWithdrawalTime(error.remainingSeconds);
+      const eligibleAt = error.eligibleAt instanceof Date
+        ? error.eligibleAt.toISOString()
+        : String(error.eligibleAt);
+      const joinedAt = error.joinedAt instanceof Date
+        ? error.joinedAt.toISOString()
+        : String(error.joinedAt);
+
+      return res.status(403).json({
+        success: false,
+        error: `Withdrawals are available ${WITHDRAWAL_WAIT_DAYS} days after joining. You can withdraw after ${eligibleAt}.`,
+        code: "WITHDRAWAL_ACCOUNT_TOO_NEW",
+        joinedAt,
+        eligibleAt,
+        ...remaining,
       });
     }
 

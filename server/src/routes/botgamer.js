@@ -3,7 +3,12 @@ const { randomUUID } = require("crypto");
 const router = express.Router();
 const { redis } = require("../config/redis");
 const {
+  MANAGED_BOT_STARTING_BALANCE_BIRR,
+  MIN_ROOM_ENTRY_BIRR,
+} = require("../config/economy");
+const {
   createRoom,
+  createSystemRoomWithAvailableName,
   createSyntheticBot,
   cleanupManagedBotUserForRoom,
   deleteRoom,
@@ -19,8 +24,10 @@ const {
   updateRoomStatus,
 } = require("../db/store");
 const { createInitialGameState } = require("../services/gameService");
-const { emitBalanceUpdates } = require("../services/balanceEvents");
+const { buildSocketByUserId, emitBalanceUpdates } = require("../services/balanceEvents");
 const { getRandomExportUsername } = require("../services/exportUsernames");
+const { buildRoomUpdatePayload, sanitizeRedisData, sanitizeRoom } = require("../services/playerPayload");
+const { SYSTEM_ROOM_NAMES } = require("../config/systemRoomNames");
 
 const BOT_PREFIX = "botgamer:";
 const BOT_TURN_DELAY_MIN_MS = 1200;
@@ -28,20 +35,7 @@ const BOT_TURN_DELAY_MAX_MS = 2800;
 const BOT_PICK_TO_LAY_MIN_MS = 850;
 const BOT_PICK_TO_LAY_MAX_MS = 1800;
 const MANAGED_ROOM_TTL_SECONDS = 10 * 60;
-const BOT_ENTRY_FEES = [2, 3, 5, 10];
-const BOT_ROOM_NAMES = [
-  "Addis Card Club",
-  "Blue Nile Table",
-  "Coffee Break Cards",
-  "Golden Hand",
-  "Late Night Carta",
-  "Merkato Masters",
-  "Rift Valley Room",
-  "Sunday Shuffle",
-  "Unity Table",
-  "Victory Corner",
-];
-
+const BOT_ENTRY_FEES = [10, 15, 20, 25, 50, 100].filter((fee) => fee >= MIN_ROOM_ENTRY_BIRR);
 const isBotId = (playerId) => String(playerId || "").startsWith(BOT_PREFIX);
 const getBotId = (userId) => `${BOT_PREFIX}${userId}`;
 const isJoker = (card) => String(card?.rank || "").toUpperCase() === "JOKER";
@@ -123,7 +117,7 @@ const buildManagedBotIdentity = () => {
   return {
     id: `${BOT_PREFIX}managed:${randomUUID()}`,
     displayName,
-    balance: randomInteger(40, 200),
+    balance: MANAGED_BOT_STARTING_BALANCE_BIRR,
   };
 };
 
@@ -190,11 +184,7 @@ const emitBotState = async (context, roomId, redisData) => {
   const room = await getRoom(roomId);
   if (!room) return;
 
-  const payload = {
-    room,
-    players: room.players,
-    redisData,
-  };
+  const payload = buildRoomUpdatePayload(room, redisData);
 
   (redisData.players || []).forEach((player) => {
     if (player.socketId) {
@@ -293,8 +283,20 @@ const runBotTurn = async (req, roomId) => {
         redisData.roomStats = await recordRoomGameResult(roomId, botId, roundPlayers, {
           jokerBonus: false,
         });
+        const settlement = redisData.roomStats?.lastSettlement || null;
+        if (settlement) {
+          redisData.gameResult = {
+            ...redisData.gameResult,
+            roundPot: settlement.roundPot,
+            roundPayout: settlement.winnerPayout,
+            winnerId: settlement.winnerId || botId,
+          };
+        }
         await cleanupManagedBotUserForRoom(roomId);
-        await emitBalanceUpdates(getIo(req), roundPlayers);
+        await emitBalanceUpdates(getIo(req), roundPlayers, {
+          socketByUserId: buildSocketByUserId(redisData.players),
+          settlement,
+        });
       }
       await emitBotState(req, roomId, redisData);
       await reconcileConnectedUsers(getIo(req));
@@ -394,7 +396,6 @@ const ensureManagedBotRoomForUser = async (io, userId) => {
 
     const entryFee = randomItem(affordableFees);
     const identity = buildManagedBotIdentity();
-    identity.balance = Math.max(identity.balance, entryFee * 4);
     const botUser = await createSyntheticBot({
       telegramId: identity.id,
       displayName: identity.displayName,
@@ -419,8 +420,7 @@ const ensureManagedBotRoomForUser = async (io, userId) => {
       entryFee,
     };
 
-    const room = await createRoom({
-      name: randomItem(BOT_ROOM_NAMES),
+    const room = await createSystemRoomWithAvailableName({
       type: "2-players",
       entryFee,
       stake: entryFee,
@@ -431,7 +431,12 @@ const ensureManagedBotRoomForUser = async (io, userId) => {
       maxPlayers: 2,
       status: "waiting",
       roomStats,
-    });
+    }, SYSTEM_ROOM_NAMES);
+    if (!room) {
+      await deleteSyntheticBot(botUser.telegramId);
+      console.error("[botgamer] System room name pool is exhausted.");
+      return null;
+    }
     const redisData = {
       status: "waiting",
       players: [{ telegramId: botUser.telegramId, socketId: null, bot: true }],
@@ -448,7 +453,7 @@ const ensureManagedBotRoomForUser = async (io, userId) => {
     await redis.set(`room:${room.id}`, JSON.stringify(redisData));
     await redis.set(`managed-bot-room:${cleanUserId}`, room.id, { EX: MANAGED_ROOM_TTL_SECONDS });
     await redis.del("rooms:list");
-    if (io) io.emit("new_room_created", room);
+    if (io) io.emit("new_room_created", sanitizeRoom(room));
     return room;
   } finally {
     await redis.del(lockKey);
@@ -482,13 +487,13 @@ const fundManagedBotForRound = async (redisData, entryFee) => {
   let botUser = await ensureSyntheticBotBalance(
     redisData.botProfile.id,
     Number(entryFee || 0),
-    randomInteger(40, 200)
+    MANAGED_BOT_STARTING_BALANCE_BIRR
   );
   if (!botUser) {
     botUser = await createSyntheticBot({
       telegramId: redisData.botProfile.id,
       displayName: redisData.botProfile.displayName || "Bot Player",
-      balance: Math.max(Number(entryFee || 0), randomInteger(40, 200)),
+      balance: MANAGED_BOT_STARTING_BALANCE_BIRR,
     });
   }
   if (!botUser) return null;
@@ -529,7 +534,6 @@ router.post("/bot-game/start", async (req, res) => {
       entryFee: 0,
       totalPot: 0,
       currentRoundPot: 0,
-      commissionAmount: 0,
     };
 
     const room = await createRoom({
@@ -570,9 +574,9 @@ router.post("/bot-game/start", async (req, res) => {
 
     return res.status(201).json({
       success: true,
-      room,
+      room: sanitizeRoom(room),
       players: room.players,
-      redisData,
+      redisData: sanitizeRedisData(redisData),
     });
   } catch (error) {
     console.error("[botgamer] start error:", error);

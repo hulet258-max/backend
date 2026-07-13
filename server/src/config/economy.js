@@ -1,37 +1,47 @@
-const COIN_BIRR_VALUE = 5;
 const MIN_DEPOSIT_BIRR = 20;
-const MIN_DEPOSIT_COINS = MIN_DEPOSIT_BIRR / COIN_BIRR_VALUE;
-const MIN_ROOM_ENTRY_COINS = 2;
-const MIN_WITHDRAW_COINS = 1;
-const REFERRAL_REWARD_COINS = 1;
-const WELCOME_GIFT_COINS = 2;
+const MIN_ROOM_ENTRY_BIRR = 10;
+const ROOM_ENTRY_STEP_BIRR = 5;
+const MIN_WITHDRAW_BIRR = 1;
+const MIN_COMMISSION_BIRR = 1;
+const MANAGED_BOT_STARTING_BALANCE_BIRR = 20000;
+const REFERRAL_REWARD_BIRR = 2;
+const WELCOME_GIFT_BIRR = 10;
 
-function toWholeCoins(value) {
+function toWholeBirr(value) {
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) return NaN;
   return Math.round(parsed);
 }
 
-function isWholeCoinAmount(value) {
+function isWholeBirrAmount(value) {
   const parsed = Number(value);
   return Number.isFinite(parsed) && Number.isInteger(parsed);
 }
 
-function birrToCoins(birrAmount) {
+function isValidRoomEntryBirr(value) {
+  const parsed = Number(value);
+  return isWholeBirrAmount(parsed) &&
+    parsed >= MIN_ROOM_ENTRY_BIRR &&
+    parsed % ROOM_ENTRY_STEP_BIRR === 0;
+}
+
+function birrToBalance(birrAmount) {
   const parsed = Number(birrAmount);
   if (!Number.isFinite(parsed)) return NaN;
-  return Math.floor(parsed / COIN_BIRR_VALUE);
+  return parsed;
 }
 
 module.exports = {
-  COIN_BIRR_VALUE,
   MIN_DEPOSIT_BIRR,
-  MIN_DEPOSIT_COINS,
-  MIN_ROOM_ENTRY_COINS,
-  MIN_WITHDRAW_COINS,
-  REFERRAL_REWARD_COINS,
-  WELCOME_GIFT_COINS,
-  birrToCoins,
-  isWholeCoinAmount,
-  toWholeCoins,
+  MIN_ROOM_ENTRY_BIRR,
+  ROOM_ENTRY_STEP_BIRR,
+  MIN_WITHDRAW_BIRR,
+  MIN_COMMISSION_BIRR,
+  MANAGED_BOT_STARTING_BALANCE_BIRR,
+  REFERRAL_REWARD_BIRR,
+  WELCOME_GIFT_BIRR,
+  birrToBalance,
+  isValidRoomEntryBirr,
+  isWholeBirrAmount,
+  toWholeBirr,
 };

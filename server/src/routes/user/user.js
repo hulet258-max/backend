@@ -7,17 +7,20 @@ const {
   getPublicUsers,
   getUserProfile,
   updateUserDisplayName,
+  acknowledgeWelcomeGift,
+  getUnreadNotifications,
+  acknowledgeNotification,
 } = require("../../db/store");
 
 router.post("/telegram-user", async (req, res) => {
   try {
-    const { telegramId } = req.body;
+    const { telegramId, username, firstName, lastName } = req.body;
 
     if (!telegramId) {
       return res.status(400).json({ success: false, error: "telegramId missing" });
     }
 
-    const user = await ensureUser(telegramId);
+    const user = await ensureUser(telegramId, { username, firstName, lastName });
 
     res.json({ success: true, user });
   } catch (err) {
@@ -62,6 +65,40 @@ router.post("/users/public", async (req, res) => {
     return res.json({ success: true, users });
   } catch (err) {
     console.error(" /api/users/public error:", err);
+    return res.status(500).json({ success: false, error: "Server error" });
+  }
+});
+
+router.post("/welcome-gift/ack", async (req, res) => {
+  try {
+    if (!req.body?.userId) return res.status(400).json({ success: false, error: "Missing userId" });
+    const user = await acknowledgeWelcomeGift(req.body.userId);
+    return res.json({ success: true, user });
+  } catch (err) {
+    console.error(" /api/welcome-gift/ack error:", err);
+    return res.status(500).json({ success: false, error: "Server error" });
+  }
+});
+
+router.post("/notifications", async (req, res) => {
+  try {
+    if (!req.body?.userId) return res.status(400).json({ success: false, error: "Missing userId" });
+    const notifications = await getUnreadNotifications(req.body.userId);
+    return res.json({ success: true, notifications });
+  } catch (err) {
+    console.error(" /api/notifications error:", err);
+    return res.status(500).json({ success: false, error: "Server error" });
+  }
+});
+
+router.post("/notifications/read", async (req, res) => {
+  try {
+    const { userId, notificationId } = req.body || {};
+    if (!userId || !notificationId) return res.status(400).json({ success: false, error: "Missing notification data" });
+    const notification = await acknowledgeNotification(userId, notificationId);
+    return res.json({ success: true, notification });
+  } catch (err) {
+    console.error(" /api/notifications/read error:", err);
     return res.status(500).json({ success: false, error: "Server error" });
   }
 });

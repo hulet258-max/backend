@@ -10,7 +10,8 @@ CREATE TABLE IF NOT EXISTS users (
   room_in TEXT,
   deposit_sum NUMERIC(12, 0) NOT NULL DEFAULT 0,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  last_seen TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  last_seen TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  welcome_gift_seen BOOLEAN NOT NULL DEFAULT FALSE
 );
 
 ALTER TABLE users ADD COLUMN IF NOT EXISTS phone TEXT;
@@ -24,6 +25,10 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS room_in TEXT;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS deposit_sum NUMERIC(12, 0) NOT NULL DEFAULT 0;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
 ALTER TABLE users ADD COLUMN IF NOT EXISTS last_seen TIMESTAMPTZ NOT NULL DEFAULT NOW();
+ALTER TABLE users ADD COLUMN IF NOT EXISTS welcome_gift_seen BOOLEAN;
+UPDATE users SET welcome_gift_seen = TRUE WHERE welcome_gift_seen IS NULL;
+ALTER TABLE users ALTER COLUMN welcome_gift_seen SET DEFAULT FALSE;
+ALTER TABLE users ALTER COLUMN welcome_gift_seen SET NOT NULL;
 
 CREATE TABLE IF NOT EXISTS rooms (
   id TEXT PRIMARY KEY,
@@ -124,6 +129,33 @@ CREATE TABLE IF NOT EXISTS referral_awards (
   UNIQUE (code, referred_user_id)
 );
 
+CREATE TABLE IF NOT EXISTS user_notifications (
+  id BIGSERIAL PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(telegram_id) ON DELETE CASCADE,
+  type TEXT NOT NULL,
+  data JSONB NOT NULL DEFAULT '{}'::jsonb,
+  read_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_notifications_unread
+  ON user_notifications (user_id, created_at DESC) WHERE read_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS analytics_events (
+  id BIGSERIAL PRIMARY KEY,
+  user_id TEXT,
+  session_id TEXT NOT NULL,
+  event_name TEXT NOT NULL,
+  path TEXT NOT NULL DEFAULT '/',
+  metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_analytics_events_created
+  ON analytics_events (created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_analytics_events_name_created
+  ON analytics_events (event_name, created_at DESC);
+
 CREATE TABLE IF NOT EXISTS admin_posters (
   id BIGSERIAL PRIMARY KEY,
   image_url TEXT NOT NULL,
@@ -154,11 +186,16 @@ CREATE TABLE IF NOT EXISTS admin_messages (
   id BIGSERIAL PRIMARY KEY,
   text TEXT NOT NULL DEFAULT '',
   image_url TEXT NOT NULL DEFAULT '',
+  button_text TEXT NOT NULL DEFAULT '',
+  web_app_url TEXT NOT NULL DEFAULT '',
   target_mode TEXT NOT NULL DEFAULT 'filtered',
   target_count INTEGER NOT NULL DEFAULT 0,
   filters JSONB NOT NULL DEFAULT '{}'::jsonb,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+ALTER TABLE admin_messages ADD COLUMN IF NOT EXISTS button_text TEXT NOT NULL DEFAULT '';
+ALTER TABLE admin_messages ADD COLUMN IF NOT EXISTS web_app_url TEXT NOT NULL DEFAULT '';
 
 CREATE TABLE IF NOT EXISTS admin_message_recipients (
   id BIGSERIAL PRIMARY KEY,

@@ -1,15 +1,16 @@
 const { randomUUID } = require("crypto");
 const { pool, query } = require("../config/postgres");
 const {
-  REFERRAL_REWARD_COINS,
-  WELCOME_GIFT_COINS,
+  MIN_COMMISSION_BIRR,
+  REFERRAL_REWARD_BIRR,
+  WELCOME_GIFT_BIRR,
 } = require("../config/economy");
 
 let schemaReadyPromise = null;
 
 function parseNumber(value) {
   const parsed = Number(value);
-  return Number.isFinite(parsed) ? Math.round(parsed) : 0;
+  return Number.isFinite(parsed) ? parsed : 0;
 }
 
 function mapUser(row) {
@@ -25,6 +26,7 @@ function mapUser(row) {
     displayName: row.username || row.display_name || row.first_name || "User",
     firstName: row.first_name || "",
     lastName: row.last_name || "",
+    welcomeGiftSeen: Boolean(row.welcome_gift_seen),
     balance,
     nonWithdrawableBalance,
     withdrawableBalance: Math.max(balance - nonWithdrawableBalance, 0),
@@ -71,27 +73,43 @@ function mapRoom(row) {
 
 function roundMoney(value) {
   const parsed = Number(value || 0);
-  return Number.isFinite(parsed) ? Math.round(parsed) : 0;
+  // Keep fractional-Birr precision while removing JavaScript floating-point noise.
+  return Number.isFinite(parsed) ? Number(parsed.toFixed(4)) : 0;
 }
 
 function getCommissionRate(entryFee, gamesPlayed = 0) {
   const fee = roundMoney(entryFee);
   if (fee <= 0) return 0;
-  let rate = 0.01;
-  if (fee >= 250) rate = 0.05;
-  else if (fee >= 100) rate = 0.04;
-  else if (fee >= 50) rate = 0.03;
-  else if (fee >= 25) rate = 0.02;
-  else if (fee >= 10) rate = 0.015;
-
-  const playedGrowth = Math.max(Number(gamesPlayed || 0), 0) * 0.0025;
-  return Math.min(rate + playedGrowth, 0.08);
+  // Reward players who keep replaying in the same room. The rate is based on
+  // completed paid-round count (or the round currently being settled), not on
+  // the entry-fee tier. A newly escrowed room reports the round-one rate.
+  const roundNumber = Math.max(1, Math.floor(Number(gamesPlayed || 0)));
+  if (roundNumber <= 3) return 0.07;
+  if (roundNumber <= 7) return 0.06;
+  if (roundNumber <= 15) return 0.05;
+  return 0.04;
 }
 
 function calculateCommissionAmount(totalPot, entryFee, gamesPlayed = 0) {
   const pot = roundMoney(totalPot);
   if (pot <= 0) return 0;
-  return Math.min(pot, Math.max(0, Math.round(pot * getCommissionRate(entryFee, gamesPlayed))));
+  // Commission is always charged in whole Birr. Standard rounding makes
+  // fractions below .50 round down and fractions of .50 or more round up.
+  const proportionalCommission = Math.round(pot * getCommissionRate(entryFee, gamesPlayed));
+  return Math.min(pot, Math.max(MIN_COMMISSION_BIRR, proportionalCommission));
+}
+
+function normalizeLastSettlement(settlement = null) {
+  if (!settlement || typeof settlement !== "object") return null;
+  return {
+    round: Number(settlement.round || 0),
+    winnerId: settlement.winnerId ? String(settlement.winnerId) : null,
+    roundPot: roundMoney(settlement.roundPot || 0),
+    commissionAmount: roundMoney(settlement.commissionAmount || 0),
+    commissionRate: Number(settlement.commissionRate || 0),
+    winnerPayout: roundMoney(settlement.winnerPayout || 0),
+    settledAt: settlement.settledAt || null,
+  };
 }
 
 function normalizeRoomStats(stats = {}) {
@@ -121,6 +139,7 @@ function normalizeRoomStats(stats = {}) {
     topWinnerIds: (stats.topWinnerIds || []).map(String),
     finalizedReason: stats.finalizedReason || null,
     finalizedAt: stats.finalizedAt || null,
+    lastSettlement: normalizeLastSettlement(stats.lastSettlement),
     practice: Boolean(stats.practice),
     botGame: Boolean(stats.botGame),
     managedBotRoom: Boolean(stats.managedBotRoom),
@@ -231,35 +250,38 @@ async function cleanupManagedBotUserForRoom(roomId) {
   }
 }
 
-async function ensureUser(telegramId) {
+async function ensureUser(telegramId, telegramProfile = {}) {
   const cleanTelegramId = String(telegramId);
+  const username = String(telegramProfile.username || "").replace(/^@/, "").trim();
+  const firstName = String(telegramProfile.firstName || telegramProfile.first_name || "").trim();
+  const lastName = String(telegramProfile.lastName || telegramProfile.last_name || "").trim();
   const insertResult = await query(
-    `INSERT INTO users (telegram_id, balance, non_withdrawable_balance)
-    VALUES ($1, $2, $2)
-    ON CONFLICT (telegram_id) DO NOTHING
-    RETURNING *`,
-    [cleanTelegramId, WELCOME_GIFT_COINS]
+    `INSERT INTO users (
+      telegram_id, username, first_name, last_name, balance, non_withdrawable_balance, welcome_gift_seen
+    )
+    VALUES ($1, $2, $3, $4, $5, $5, FALSE)
+    ON CONFLICT (telegram_id) DO UPDATE SET
+      username = COALESCE(NULLIF(EXCLUDED.username, ''), users.username),
+      first_name = COALESCE(NULLIF(EXCLUDED.first_name, ''), users.first_name),
+      last_name = COALESCE(NULLIF(EXCLUDED.last_name, ''), users.last_name),
+      last_seen = NOW()
+    RETURNING *, (xmax = 0) AS was_inserted`,
+    [cleanTelegramId, username, firstName, lastName, WELCOME_GIFT_BIRR]
   );
 
-  if (insertResult.rows[0]) {
+  const shouldShowWelcomeGift = !Boolean(insertResult.rows[0]?.welcome_gift_seen);
+  if (shouldShowWelcomeGift) {
     return {
       ...mapUser(insertResult.rows[0]),
       isFirstRun: true,
-      firstRunGiftCoins: WELCOME_GIFT_COINS,
+      firstRunGiftBirr: WELCOME_GIFT_BIRR,
     };
   }
 
-  const updateResult = await query(
-    `UPDATE users
-    SET last_seen = NOW()
-    WHERE telegram_id = $1
-    RETURNING *`,
-    [cleanTelegramId]
-  );
   return {
-    ...mapUser(updateResult.rows[0]),
+    ...mapUser(insertResult.rows[0]),
     isFirstRun: false,
-    firstRunGiftCoins: 0,
+    firstRunGiftBirr: 0,
   };
 }
 
@@ -283,12 +305,13 @@ async function ensureAppSchemaOnce() {
       display_name TEXT DEFAULT '',
       first_name TEXT DEFAULT '',
       last_name TEXT DEFAULT '',
-      balance NUMERIC(12, 0) NOT NULL DEFAULT 0,
-      non_withdrawable_balance NUMERIC(12, 0) NOT NULL DEFAULT 0,
+      balance NUMERIC(16, 4) NOT NULL DEFAULT 0,
+      non_withdrawable_balance NUMERIC(16, 4) NOT NULL DEFAULT 0,
       room_in TEXT,
-      deposit_sum NUMERIC(12, 0) NOT NULL DEFAULT 0,
+      deposit_sum NUMERIC(16, 4) NOT NULL DEFAULT 0,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      last_seen TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      last_seen TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      welcome_gift_seen BOOLEAN NOT NULL DEFAULT FALSE
     )
   `);
   await query("ALTER TABLE users ADD COLUMN IF NOT EXISTS phone TEXT");
@@ -296,12 +319,19 @@ async function ensureAppSchemaOnce() {
   await query("ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name TEXT DEFAULT ''");
   await query("ALTER TABLE users ADD COLUMN IF NOT EXISTS first_name TEXT DEFAULT ''");
   await query("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_name TEXT DEFAULT ''");
-  await query("ALTER TABLE users ADD COLUMN IF NOT EXISTS balance NUMERIC(12, 0) NOT NULL DEFAULT 0");
-  await query("ALTER TABLE users ADD COLUMN IF NOT EXISTS non_withdrawable_balance NUMERIC(12, 0) NOT NULL DEFAULT 0");
+  await query("ALTER TABLE users ADD COLUMN IF NOT EXISTS balance NUMERIC(16, 4) NOT NULL DEFAULT 0");
+  await query("ALTER TABLE users ADD COLUMN IF NOT EXISTS non_withdrawable_balance NUMERIC(16, 4) NOT NULL DEFAULT 0");
   await query("ALTER TABLE users ADD COLUMN IF NOT EXISTS room_in TEXT");
-  await query("ALTER TABLE users ADD COLUMN IF NOT EXISTS deposit_sum NUMERIC(12, 0) NOT NULL DEFAULT 0");
+  await query("ALTER TABLE users ADD COLUMN IF NOT EXISTS deposit_sum NUMERIC(16, 4) NOT NULL DEFAULT 0");
+  await query("ALTER TABLE users ALTER COLUMN balance TYPE NUMERIC(16, 4) USING balance::NUMERIC(16, 4)");
+  await query("ALTER TABLE users ALTER COLUMN non_withdrawable_balance TYPE NUMERIC(16, 4) USING non_withdrawable_balance::NUMERIC(16, 4)");
+  await query("ALTER TABLE users ALTER COLUMN deposit_sum TYPE NUMERIC(16, 4) USING deposit_sum::NUMERIC(16, 4)");
   await query("ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()");
   await query("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_seen TIMESTAMPTZ NOT NULL DEFAULT NOW()");
+  await query("ALTER TABLE users ADD COLUMN IF NOT EXISTS welcome_gift_seen BOOLEAN");
+  await query("UPDATE users SET welcome_gift_seen = TRUE WHERE welcome_gift_seen IS NULL");
+  await query("ALTER TABLE users ALTER COLUMN welcome_gift_seen SET DEFAULT FALSE");
+  await query("ALTER TABLE users ALTER COLUMN welcome_gift_seen SET NOT NULL");
   await query(`
     CREATE UNIQUE INDEX IF NOT EXISTS idx_users_display_name_unique
     ON users (LOWER(display_name))
@@ -313,8 +343,8 @@ async function ensureAppSchemaOnce() {
       id TEXT PRIMARY KEY,
       name TEXT NOT NULL,
       type TEXT NOT NULL,
-      entry_fee NUMERIC(12, 0) NOT NULL DEFAULT 0,
-      stake NUMERIC(12, 0) NOT NULL DEFAULT 0,
+      entry_fee NUMERIC(16, 4) NOT NULL DEFAULT 0,
+      stake NUMERIC(16, 4) NOT NULL DEFAULT 0,
       creator_id TEXT NOT NULL REFERENCES users(telegram_id) ON DELETE CASCADE,
       visibility TEXT NOT NULL DEFAULT 'public' CHECK (visibility IN ('public', 'private')),
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -332,6 +362,8 @@ async function ensureAppSchemaOnce() {
   await query("ALTER TABLE rooms ADD COLUMN IF NOT EXISTS max_players INTEGER NOT NULL DEFAULT 2");
   await query("ALTER TABLE rooms ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'waiting'");
   await query("ALTER TABLE rooms ADD COLUMN IF NOT EXISTS room_stats JSONB NOT NULL DEFAULT '{\"gamesPlayed\":0,\"winnerCounts\":{}}'::jsonb");
+  await query("ALTER TABLE rooms ALTER COLUMN entry_fee TYPE NUMERIC(16, 4) USING entry_fee::NUMERIC(16, 4)");
+  await query("ALTER TABLE rooms ALTER COLUMN stake TYPE NUMERIC(16, 4) USING stake::NUMERIC(16, 4)");
   await query(`
     CREATE INDEX IF NOT EXISTS idx_rooms_visibility_created_at
     ON rooms (visibility, created_at DESC)
@@ -341,29 +373,56 @@ async function ensureAppSchemaOnce() {
     CREATE TABLE IF NOT EXISTS transactions (
       id TEXT PRIMARY KEY,
       user_id TEXT NOT NULL REFERENCES users(telegram_id) ON DELETE CASCADE,
-      amount NUMERIC(12, 0) NOT NULL,
+      amount NUMERIC(16, 4) NOT NULL,
       timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `);
+  await query("ALTER TABLE transactions ALTER COLUMN amount TYPE NUMERIC(16, 4) USING amount::NUMERIC(16, 4)");
   await query("CREATE INDEX IF NOT EXISTS idx_transactions_timestamp ON transactions (timestamp DESC)");
 
   await query(`
     CREATE TABLE IF NOT EXISTS stats (
       key TEXT PRIMARY KEY,
-      total_amount NUMERIC(12, 0) NOT NULL DEFAULT 0,
+      total_amount NUMERIC(16, 4) NOT NULL DEFAULT 0,
       count INTEGER NOT NULL DEFAULT 0
     )
   `);
+  await query("ALTER TABLE stats ALTER COLUMN total_amount TYPE NUMERIC(16, 4) USING total_amount::NUMERIC(16, 4)");
 
   await ensureReferralTables();
   await query(`
     CREATE TABLE IF NOT EXISTS user_game_stats (
       user_id TEXT PRIMARY KEY REFERENCES users(telegram_id) ON DELETE CASCADE,
       games_played INTEGER NOT NULL DEFAULT 0,
-      amount_played NUMERIC(12, 0) NOT NULL DEFAULT 0,
+      amount_played NUMERIC(16, 4) NOT NULL DEFAULT 0,
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `);
+  await query("ALTER TABLE user_game_stats ALTER COLUMN amount_played TYPE NUMERIC(16, 4) USING amount_played::NUMERIC(16, 4)");
+  await query(`
+    CREATE TABLE IF NOT EXISTS user_notifications (
+      id BIGSERIAL PRIMARY KEY,
+      user_id TEXT NOT NULL REFERENCES users(telegram_id) ON DELETE CASCADE,
+      type TEXT NOT NULL,
+      data JSONB NOT NULL DEFAULT '{}'::jsonb,
+      read_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await query("CREATE INDEX IF NOT EXISTS idx_user_notifications_unread ON user_notifications (user_id, created_at DESC) WHERE read_at IS NULL");
+  await query(`
+    CREATE TABLE IF NOT EXISTS analytics_events (
+      id BIGSERIAL PRIMARY KEY,
+      user_id TEXT,
+      session_id TEXT NOT NULL,
+      event_name TEXT NOT NULL,
+      path TEXT NOT NULL DEFAULT '/',
+      metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await query("CREATE INDEX IF NOT EXISTS idx_analytics_events_created ON analytics_events (created_at DESC)");
+  await query("CREATE INDEX IF NOT EXISTS idx_analytics_events_name_created ON analytics_events (event_name, created_at DESC)");
   await backfillNonWithdrawableGiftBalance();
   await ensureRoomArchiveTable();
   await ensureAdminContentTables();
@@ -407,7 +466,7 @@ async function backfillNonWithdrawableGiftBalance() {
           ), 0)
         )
       ) > 0`,
-    [WELCOME_GIFT_COINS]
+    [WELCOME_GIFT_BIRR]
   );
 }
 
@@ -491,12 +550,49 @@ async function getUserProfile(userId) {
     referralStats: {
       shareCount,
       rewardCount,
-      earnedCoins: rewardCount * REFERRAL_REWARD_COINS,
-      earnedBirr: rewardCount * REFERRAL_REWARD_COINS,
+      earnedBirr: rewardCount * REFERRAL_REWARD_BIRR,
       rewardsLeft: Math.max(maxRewards - rewardCount, 0),
       maxRewards,
     },
   };
+}
+
+async function acknowledgeWelcomeGift(userId) {
+  const result = await query(
+    `UPDATE users SET welcome_gift_seen = TRUE, last_seen = NOW()
+    WHERE telegram_id = $1 RETURNING *`,
+    [String(userId)]
+  );
+  return mapUser(result.rows[0]);
+}
+
+function mapNotification(row) {
+  return {
+    id: Number(row.id),
+    type: row.type,
+    data: row.data || {},
+    createdAt: row.created_at,
+  };
+}
+
+async function getUnreadNotifications(userId) {
+  const result = await query(
+    `SELECT * FROM user_notifications
+    WHERE user_id = $1 AND read_at IS NULL
+    ORDER BY created_at ASC LIMIT 20`,
+    [String(userId)]
+  );
+  return result.rows.map(mapNotification);
+}
+
+async function acknowledgeNotification(userId, notificationId) {
+  const result = await query(
+    `UPDATE user_notifications SET read_at = NOW()
+    WHERE id = $1 AND user_id = $2 AND read_at IS NULL
+    RETURNING *`,
+    [Number(notificationId), String(userId)]
+  );
+  return mapNotification(result.rows[0]);
 }
 
 async function incrementUserAmountPlayed(userIds, amount) {
@@ -532,9 +628,9 @@ async function incrementUserGamesPlayed(userIds) {
 
 async function upsertUser(telegramUser) {
   const telegramId = String(telegramUser.telegramId);
-  const initialBalance = telegramUser.balance ?? WELCOME_GIFT_COINS;
+  const initialBalance = telegramUser.balance ?? WELCOME_GIFT_BIRR;
   const initialNonWithdrawable = telegramUser.nonWithdrawableBalance ?? (
-    telegramUser.balance === undefined ? WELCOME_GIFT_COINS : 0
+    telegramUser.balance === undefined ? WELCOME_GIFT_BIRR : 0
   );
   const result = await query(
     `INSERT INTO users (
@@ -596,6 +692,64 @@ async function createRoom(room) {
     [String(createdRoom.id), (createdRoom.players || []).map(String)]
   );
   return createdRoom;
+}
+
+async function createSystemRoomWithAvailableName(room, names) {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    // Transaction-scoped and shared by every application instance using this DB.
+    await client.query("SELECT pg_advisory_xact_lock($1)", [73425109]);
+
+    const usedResult = await client.query(
+      `SELECT name FROM rooms
+      WHERE status IN ('waiting', 'playing', 'ended')
+        AND COALESCE(room_stats->>'managedBotRoom', 'false') = 'true'`
+    );
+    const usedNames = new Set(usedResult.rows.map((row) => row.name));
+    const availableNames = names.filter((name) => !usedNames.has(name));
+    if (!availableNames.length) {
+      await client.query("ROLLBACK");
+      return null;
+    }
+
+    const name = availableNames[Math.floor(Math.random() * availableNames.length)];
+    const id = randomUUID();
+    const result = await client.query(
+      `INSERT INTO rooms (
+        id, name, type, entry_fee, stake, creator_id, visibility, players,
+        player_count, max_players, status, room_stats
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+      RETURNING *`,
+      [
+        id,
+        name,
+        room.type,
+        room.entryFee,
+        room.stake,
+        String(room.creatorId),
+        room.visibility,
+        (room.players || []).map(String),
+        room.playerCount,
+        room.maxPlayers,
+        room.status,
+        JSON.stringify(room.roomStats || { gamesPlayed: 0, winnerCounts: {} }),
+      ]
+    );
+    const createdRoom = mapRoom(result.rows[0]);
+    await client.query(
+      "UPDATE users SET room_in = $1 WHERE telegram_id = ANY($2::text[])",
+      [String(createdRoom.id), (createdRoom.players || []).map(String)]
+    );
+    await client.query("COMMIT");
+    return createdRoom;
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
 async function getRoom(roomId) {
@@ -737,6 +891,7 @@ async function listPublicRooms() {
     `SELECT * FROM rooms
     WHERE visibility = 'public'
       AND status IN ('waiting', 'playing', 'ended')
+      AND player_count < max_players
       AND COALESCE(room_stats->>'practice', 'false') <> 'true'
     ORDER BY created_at DESC`
   );
@@ -777,16 +932,16 @@ async function listLobbyRooms(userId) {
 
   const result = await query(
     `SELECT * FROM rooms
-    WHERE (
+    WHERE COALESCE(room_stats->>'practice', 'false') <> 'true'
+      AND ((
         visibility = 'public'
         AND status IN ('waiting', 'playing', 'ended')
-        AND COALESCE(room_stats->>'practice', 'false') <> 'true'
+        AND player_count < max_players
       )
       OR (
         players @> ARRAY[$1::text]
         AND status IN ('waiting', 'playing', 'ended')
-        AND COALESCE(room_stats->>'practice', 'false') <> 'true'
-      )
+      ))
     ORDER BY
       CASE WHEN players @> ARRAY[$1::text] AND status IN ('waiting', 'playing', 'ended') THEN 0 ELSE 1 END,
       created_at DESC`,
@@ -955,6 +1110,7 @@ async function escrowRoomEntryFees(roomId, playerIds, entryFee) {
       feeEscrowed: true,
       escrowRefunded: false,
       escrowSettled: false,
+      lastSettlement: null,
       escrowPlayers: [...new Set([...(roomStats.escrowPlayers || []), ...normalizedPlayerIds])],
       currentRoundPlayers: normalizedPlayerIds,
       currentRoundBonusEscrow,
@@ -991,20 +1147,39 @@ async function recordRoomGameResult(roomId, winnerId, playerIds, options = {}) {
     if (!room) throw new Error("ROOM_NOT_FOUND");
 
     const roomStats = normalizeRoomStats(room.roomStats);
+
+    // Idempotent: only settle once while fees are still escrowed for this round.
+    if (!roomStats.feeEscrowed || roomStats.escrowSettled || roomStats.escrowRefunded) {
+      await client.query("COMMIT");
+      return normalizeRoomStats(roomStats);
+    }
+
     const roundNumber = roomStats.gamesPlayed + 1;
     const normalizedWinnerId = String(winnerId);
-    const normalizedPlayerIds = playerIds.map(String);
+    const normalizedPlayerIds = (playerIds || []).map(String);
     const roundPlayers = roomStats.currentRoundPlayers.length
       ? roomStats.currentRoundPlayers
       : normalizedPlayerIds;
-    const roundPot = roundMoney(roomStats.currentRoundPot || roomStats.entryFee * roundPlayers.length);
+    const roundPot = roundMoney(
+      roomStats.currentRoundPot > 0
+        ? roomStats.currentRoundPot
+        : roomStats.entryFee * Math.max(roundPlayers.length, 1)
+    );
+    if (roundPot <= 0) {
+      throw new Error("ROUND_POT_EMPTY");
+    }
+
+    const commissionRate = getCommissionRate(roomStats.entryFee, roundNumber);
     const commissionAmount = calculateCommissionAmount(roundPot, roomStats.entryFee, roundNumber);
     const winnerPayout = roundMoney(roundPot - commissionAmount);
 
-    await client.query(
-      "UPDATE users SET balance = balance + $2 WHERE telegram_id = $1",
+    const payoutResult = await client.query(
+      "UPDATE users SET balance = balance + $2 WHERE telegram_id = $1 RETURNING balance",
       [normalizedWinnerId, winnerPayout]
     );
+    if (payoutResult.rowCount !== 1) {
+      throw new Error(`WINNER_NOT_FOUND:${normalizedWinnerId}`);
+    }
 
     roomStats.gamesPlayed = roundNumber;
     roomStats.winnerCounts[normalizedWinnerId] = Number(roomStats.winnerCounts[normalizedWinnerId] || 0) + 1;
@@ -1013,7 +1188,7 @@ async function recordRoomGameResult(roomId, winnerId, playerIds, options = {}) {
     roomStats.winnerWeights[normalizedWinnerId] = roundMoney(Number(roomStats.winnerWeights[normalizedWinnerId] || 0) + winWeight);
     roomStats.totalPot = roundMoney(Number(roomStats.totalPot || 0) + roundPot);
     roomStats.commissionAmount = roundMoney(Number(roomStats.commissionAmount || 0) + commissionAmount);
-    roomStats.commissionRate = getCommissionRate(roomStats.entryFee, roundNumber);
+    roomStats.commissionRate = commissionRate;
     roomStats.payouts = {
       ...(roomStats.payouts || {}),
       [normalizedWinnerId]: roundMoney(Number(roomStats.payouts?.[normalizedWinnerId] || 0) + winnerPayout),
@@ -1041,29 +1216,41 @@ async function recordRoomGameResult(roomId, winnerId, playerIds, options = {}) {
     roomStats.topWinnerIds = Object.entries(roomStats.winnerWeights)
       .sort(([, a], [, b]) => Number(b || 0) - Number(a || 0))
       .map(([playerId]) => playerId);
+    const settledAt = new Date().toISOString();
     roomStats.games.push({
       round: roundNumber,
       players: roundPlayers,
       entryFee: roomStats.entryFee,
       roundAmountToWin: roundPot,
       roundCommission: commissionAmount,
+      commissionRate,
       roundPayout: winnerPayout,
       totalAmountToWin: roomStats.totalPot,
       winnerId: normalizedWinnerId,
       jokerBonus: Boolean(options.jokerBonus),
       winWeight,
-      completedAt: new Date().toISOString(),
+      completedAt: settledAt,
     });
+    roomStats.lastSettlement = {
+      round: roundNumber,
+      winnerId: normalizedWinnerId,
+      roundPot,
+      commissionAmount,
+      commissionRate,
+      winnerPayout,
+      settledAt,
+    };
     roomStats.feeEscrowed = false;
     roomStats.currentRoundPlayers = [];
     roomStats.currentRoundBonusEscrow = {};
     roomStats.currentRoundPot = 0;
     roomStats.escrowRefunded = false;
-    roomStats.escrowSettled = false;
+    roomStats.escrowSettled = true;
 
+    const normalized = normalizeRoomStats(roomStats);
     await client.query("UPDATE rooms SET room_stats = $2 WHERE id = $1", [
       String(roomId),
-      JSON.stringify(normalizeRoomStats(roomStats)),
+      JSON.stringify(normalized),
     ]);
 
     await client.query(
@@ -1077,7 +1264,7 @@ async function recordRoomGameResult(roomId, winnerId, playerIds, options = {}) {
     );
 
     await client.query("COMMIT");
-    return normalizeRoomStats(roomStats);
+    return normalized;
   } catch (error) {
     await client.query("ROLLBACK");
     throw error;
@@ -1166,14 +1353,14 @@ async function transactionExists(transactionId) {
 
 async function saveDepositTransaction(transactionId, userId, amount) {
   await ensureAppSchema();
-  const coinAmount = roundMoney(amount);
+  const birrAmount = roundMoney(amount);
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
     await client.query(
       `INSERT INTO transactions (id, user_id, amount)
       VALUES ($1, $2, $3)`,
-      [String(transactionId), String(userId), coinAmount]
+      [String(transactionId), String(userId), birrAmount]
     );
     await client.query(
       `INSERT INTO stats (key, total_amount, count)
@@ -1181,14 +1368,14 @@ async function saveDepositTransaction(transactionId, userId, amount) {
       ON CONFLICT (key) DO UPDATE SET
         total_amount = stats.total_amount + EXCLUDED.total_amount,
         count = stats.count + 1`,
-      [coinAmount]
+      [birrAmount]
     );
     await client.query(
       `INSERT INTO users (telegram_id, balance)
       VALUES ($1, $2)
       ON CONFLICT (telegram_id) DO UPDATE SET
         balance = users.balance + EXCLUDED.balance`,
-      [String(userId), coinAmount]
+      [String(userId), birrAmount]
     );
     await client.query("COMMIT");
   } catch (error) {
@@ -1200,38 +1387,56 @@ async function saveDepositTransaction(transactionId, userId, amount) {
 }
 
 async function addBalance(userId, amount) {
-  const coinAmount = roundMoney(amount);
+  const birrAmount = roundMoney(amount);
   await query(
     `INSERT INTO users (telegram_id, balance)
     VALUES ($1, $2)
     ON CONFLICT (telegram_id) DO UPDATE SET
       balance = users.balance + EXCLUDED.balance`,
-    [String(userId), coinAmount]
+    [String(userId), birrAmount]
   );
 }
 
 async function withdrawBalance(userId, amount, phone) {
-  const coinAmount = roundMoney(amount);
+  const birrAmount = roundMoney(amount);
   const normalizedPhone = String(phone || "").trim().replace(/\s+/g, " ");
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
     const result = await client.query(
-      "SELECT * FROM users WHERE telegram_id = $1 FOR UPDATE",
+      `SELECT *,
+        created_at + INTERVAL '30 days' AS withdrawal_eligible_at,
+        NOW() >= created_at + INTERVAL '30 days' AS withdrawal_eligible,
+        GREATEST(
+          EXTRACT(EPOCH FROM (created_at + INTERVAL '30 days' - NOW())),
+          0
+        ) AS withdrawal_remaining_seconds
+      FROM users
+      WHERE telegram_id = $1
+      FOR UPDATE`,
       [String(userId)]
     );
 
     if (!result.rows[0]) throw new Error("USER_NOT_FOUND");
 
-    const user = mapUser(result.rows[0]);
-    if (user.withdrawableBalance < coinAmount) {
+    const userRow = result.rows[0];
+    if (!userRow.withdrawal_eligible) {
+      const error = new Error("WITHDRAWAL_ACCOUNT_TOO_NEW");
+      error.joinedAt = userRow.created_at;
+      error.eligibleAt = userRow.withdrawal_eligible_at;
+      error.remainingSeconds = Math.max(0, Math.ceil(parseNumber(userRow.withdrawal_remaining_seconds)));
+      throw error;
+    }
+
+    const user = mapUser(userRow);
+    if (user.withdrawableBalance < birrAmount) {
       const error = new Error("INSUFFICIENT_WITHDRAWABLE_BALANCE");
       error.withdrawableBalance = user.withdrawableBalance;
       error.nonWithdrawableBalance = user.nonWithdrawableBalance;
       throw error;
     }
 
-    const nextBalance = user.balance - coinAmount;
+    const nextBalance = user.balance - birrAmount;
     await client.query("UPDATE users SET balance = $2, phone = $3 WHERE telegram_id = $1", [
       String(userId),
       nextBalance,
@@ -1275,11 +1480,12 @@ async function ensureReferralTables() {
       code TEXT NOT NULL REFERENCES referral_links(code) ON DELETE CASCADE,
       referrer_id TEXT NOT NULL REFERENCES users(telegram_id) ON DELETE CASCADE,
       referred_user_id TEXT NOT NULL REFERENCES users(telegram_id) ON DELETE CASCADE,
-      amount NUMERIC(12, 0) NOT NULL DEFAULT 1,
+      amount NUMERIC(16, 4) NOT NULL DEFAULT 1,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       UNIQUE (code, referred_user_id)
     )
   `);
+  await query("ALTER TABLE referral_awards ALTER COLUMN amount TYPE NUMERIC(16, 4) USING amount::NUMERIC(16, 4)");
 }
 
 async function ensureRoomArchiveTable() {
@@ -1288,8 +1494,8 @@ async function ensureRoomArchiveTable() {
       id TEXT PRIMARY KEY,
       name TEXT NOT NULL,
       type TEXT NOT NULL,
-      entry_fee NUMERIC(12, 0) NOT NULL DEFAULT 0,
-      stake NUMERIC(12, 0) NOT NULL DEFAULT 0,
+      entry_fee NUMERIC(16, 4) NOT NULL DEFAULT 0,
+      stake NUMERIC(16, 4) NOT NULL DEFAULT 0,
       creator_id TEXT NOT NULL,
       visibility TEXT NOT NULL DEFAULT 'public',
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -1302,6 +1508,8 @@ async function ensureRoomArchiveTable() {
       archived_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `);
+  await query("ALTER TABLE archived_rooms ALTER COLUMN entry_fee TYPE NUMERIC(16, 4) USING entry_fee::NUMERIC(16, 4)");
+  await query("ALTER TABLE archived_rooms ALTER COLUMN stake TYPE NUMERIC(16, 4) USING stake::NUMERIC(16, 4)");
   await query("CREATE INDEX IF NOT EXISTS idx_archived_rooms_archived_at ON archived_rooms (archived_at DESC)");
 }
 
@@ -1337,12 +1545,16 @@ async function ensureAdminContentTables() {
       id BIGSERIAL PRIMARY KEY,
       text TEXT NOT NULL DEFAULT '',
       image_url TEXT NOT NULL DEFAULT '',
+      button_text TEXT NOT NULL DEFAULT '',
+      web_app_url TEXT NOT NULL DEFAULT '',
       target_mode TEXT NOT NULL DEFAULT 'filtered',
       target_count INTEGER NOT NULL DEFAULT 0,
       filters JSONB NOT NULL DEFAULT '{}'::jsonb,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `);
+  await query("ALTER TABLE admin_messages ADD COLUMN IF NOT EXISTS button_text TEXT NOT NULL DEFAULT ''");
+  await query("ALTER TABLE admin_messages ADD COLUMN IF NOT EXISTS web_app_url TEXT NOT NULL DEFAULT ''");
 
   await query(`
     CREATE TABLE IF NOT EXISTS admin_message_recipients (
@@ -1452,7 +1664,7 @@ async function awardReferralIfEligible(code, referredUserId) {
       `INSERT INTO users (telegram_id, balance, non_withdrawable_balance)
       VALUES ($1, $2, $2)
       ON CONFLICT (telegram_id) DO NOTHING`,
-      [cleanReferredUserId, WELCOME_GIFT_COINS]
+      [cleanReferredUserId, WELCOME_GIFT_BIRR]
     );
 
     const existingAward = await client.query(
@@ -1467,14 +1679,30 @@ async function awardReferralIfEligible(code, referredUserId) {
     await client.query(
       `INSERT INTO referral_awards (code, referrer_id, referred_user_id, amount)
       VALUES ($1, $2, $3, $4)`,
-      [cleanCode, String(referralLink.user_id), cleanReferredUserId, REFERRAL_REWARD_COINS]
+      [cleanCode, String(referralLink.user_id), cleanReferredUserId, REFERRAL_REWARD_BIRR]
+    );
+    const referredUserResult = await client.query(
+      "SELECT username, display_name, first_name FROM users WHERE telegram_id = $1",
+      [cleanReferredUserId]
+    );
+    const referredUser = referredUserResult.rows[0] || {};
+    const referredUserName = referredUser.username || referredUser.display_name || referredUser.first_name || "A new player";
+    const notificationResult = await client.query(
+      `INSERT INTO user_notifications (user_id, type, data)
+      VALUES ($1, 'referral_reward', $2::jsonb)
+      RETURNING *`,
+      [String(referralLink.user_id), JSON.stringify({
+        amount: REFERRAL_REWARD_BIRR,
+        referredUserId: cleanReferredUserId,
+        referredUserName,
+      })]
     );
     await client.query(
       `UPDATE users
       SET balance = balance + $2,
         non_withdrawable_balance = non_withdrawable_balance + $2
       WHERE telegram_id = $1`,
-      [String(referralLink.user_id), REFERRAL_REWARD_COINS]
+      [String(referralLink.user_id), REFERRAL_REWARD_BIRR]
     );
     const updatedLink = await client.query(
       `UPDATE referral_links
@@ -1487,10 +1715,11 @@ async function awardReferralIfEligible(code, referredUserId) {
     await client.query("COMMIT");
     return {
       awarded: true,
-      amount: REFERRAL_REWARD_COINS,
+      amount: REFERRAL_REWARD_BIRR,
       referrerId: String(referralLink.user_id),
       rewardCount: Number(updatedLink.rows[0]?.reward_count || 0),
       maxRewards: Number(updatedLink.rows[0]?.max_rewards || 5),
+      notification: mapNotification(notificationResult.rows[0]),
     };
   } catch (error) {
     await client.query("ROLLBACK");
@@ -1515,9 +1744,13 @@ module.exports = {
   cleanupManagedBotUserForRoom,
   upsertUser,
   updateUserDisplayName,
+  acknowledgeWelcomeGift,
+  getUnreadNotifications,
+  acknowledgeNotification,
   getPublicUsers,
   getUserProfile,
   createRoom,
+  createSystemRoomWithAvailableName,
   getRoom,
   deleteRoom,
   updateRoomStats,
