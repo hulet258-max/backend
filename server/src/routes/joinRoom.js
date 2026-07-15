@@ -94,7 +94,7 @@ router.post("/join-room", async (req, res) => {
                     socketByUserId: buildSocketByUserId(redisData.players),
                   });
                   roomData = await updateRoomStatus(roomId, "playing");
-                  const initialGameState = createInitialGameState(roomData.players);
+                  const initialGameState = createInitialGameState(roomData.players, roomData.creatorId);
                   if (redisData.managedBotRoom) {
                     biasBotInitialHand(initialGameState, redisData.botProfile?.id || roomData.players[0]);
                   }
@@ -183,7 +183,7 @@ router.post("/join-room", async (req, res) => {
         updatedRoom = await updateRoomStatus(roomId, "playing");
         
         // Generate the game state (passing the simple array of IDs from Postgres)
-        const initialGameState = createInitialGameState(updatedRoom.players);
+        const initialGameState = createInitialGameState(updatedRoom.players, updatedRoom.creatorId);
         if (redisData.managedBotRoom) {
           biasBotInitialHand(initialGameState, redisData.botProfile?.id || updatedRoom.players[0]);
         }

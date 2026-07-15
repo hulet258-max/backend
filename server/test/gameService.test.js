@@ -20,3 +20,12 @@ for (const playerCount of [2, 3, 4]) {
     assert.equal(state.deck.length, (expectedDecks * 54) - dealtCount);
   });
 }
+
+test("deals 11 cards to an explicitly selected round starter", () => {
+  const state = createInitialGameState(["creator", "challenger", "previous-winner"], "previous-winner");
+
+  assert.equal(state.turn, "previous-winner");
+  assert.equal(state.playerCards["previous-winner"].length, 11);
+  assert.equal(state.playerCards.creator.length, 10);
+  assert.equal(state.playerCards.challenger.length, 10);
+});

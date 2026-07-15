@@ -5,7 +5,7 @@
   "main": "index.js",
   "scripts": {
     "init:db": "node scripts/initDatabase.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node --test test/*.test.js"
   },
   "keywords": [],
   "author": "",

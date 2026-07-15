@@ -155,8 +155,10 @@ const biasBotInitialHand = (gameState, botId, maximumSwaps = 2) => {
 
 const buildWinnerResult = (redisData, winnerId, analysis = analyzeWinningHand(redisData.playerCards?.[winnerId] || [])) => {
   const playerCardCounts = {};
+  const revealedHands = {};
   Object.entries(redisData.playerCards || {}).forEach(([playerId, cards]) => {
     playerCardCounts[playerId] = cards.length;
+    revealedHands[playerId] = cards.map((card) => ({ ...card }));
   });
 
   return {
@@ -164,6 +166,7 @@ const buildWinnerResult = (redisData, winnerId, analysis = analyzeWinningHand(re
     winners: [winnerId],
     winnerPattern: "4-3-3-1",
     playerCardCounts,
+    revealedHands,
     reason: analysis.jokerCount > 0 ? "joker-completed-hand" : "valid-hand",
     jokerCount: analysis.jokerCount,
     jokerBonus: false,
@@ -550,7 +553,7 @@ router.post("/bot-game/start", async (req, res) => {
       roomStats,
     });
 
-    const initialGameState = createInitialGameState([botId, cleanUserId]);
+    const initialGameState = createInitialGameState([botId, cleanUserId], cleanUserId);
     const redisData = {
       ...initialGameState,
       status: "playing",

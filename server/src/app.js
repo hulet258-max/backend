@@ -39,6 +39,10 @@ const adminRoutes = require('./routes/admin');
 const settingsRoutes = require('./routes/settings');
 const analyticsRoutes = require('./api/analytics');
 const { emitBalanceUpdates } = require('./services/balanceEvents');
+const {
+  startBroadcastWorker,
+  stopBroadcastWorker,
+} = require('./services/telegramBroadcast');
 
 const app = express();
 const server = http.createServer(app);
@@ -334,6 +338,8 @@ async function startApp(options = {}) {
     await listen(server, port);
     console.log(`Backend + Socket.IO listening on port ${port}`);
 
+    await startBroadcastWorker();
+
     if (startTelegramBot) {
       botInstance = createBot();
       await startBot(botInstance);
@@ -344,6 +350,7 @@ async function startApp(options = {}) {
     return { app, server, io, bot: botInstance };
   } catch (err) {
     started = false;
+    await stopBroadcastWorker().catch(() => {});
     if (counterInterval) clearInterval(counterInterval);
     if (cleanupInterval) clearInterval(cleanupInterval);
     if (botReconcileInterval) clearInterval(botReconcileInterval);
@@ -355,6 +362,7 @@ async function startApp(options = {}) {
 }
 
 async function stopApp() {
+  await stopBroadcastWorker();
   if (counterInterval) clearInterval(counterInterval);
   if (cleanupInterval) clearInterval(cleanupInterval);
   if (botReconcileInterval) clearInterval(botReconcileInterval);

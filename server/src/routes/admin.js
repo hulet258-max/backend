@@ -3,7 +3,7 @@ const path = require("path");
 const fs = require("fs");
 const { randomUUID } = require("crypto");
 const multer = require("multer");
-const { query } = require("../config/postgres");
+const { pool, query } = require("../config/postgres");
 const { redis } = require("../config/redis");
 const {
   calculateCommissionAmount,
@@ -14,6 +14,10 @@ const {
   getRoom,
 } = require("../db/store");
 const { emitBalanceUpdates } = require("../services/balanceEvents");
+const {
+  PLAY_BUTTON_TEXT,
+  wakeBroadcastWorker,
+} = require("../services/telegramBroadcast");
 
 const router = express.Router();
 const adminUploadDirectory = path.join(__dirname, "..", "..", "uploads", "admin");
@@ -213,7 +217,7 @@ function mapUser(row) {
     telegramId,
     phone: row.phone || "",
     username: row.username || "",
-    displayName: row.username || row.display_name || row.first_name || "User",
+    displayName: row.display_name || row.first_name || row.username || "User",
     firstName: row.first_name || "",
     lastName: row.last_name || "",
     balance: parseNumber(row.balance),
@@ -254,6 +258,11 @@ function mapDepositNumber(row) {
 }
 
 function mapAdminMessage(row) {
+  const recipientCount = Number(row.recipient_count || row.target_count || 0);
+  const sentCount = Number(row.sent_count || 0);
+  const failedCount = Number(row.failed_count || 0);
+  const queuedCount = Number(row.queued_count || 0);
+  const sendingCount = Number(row.sending_count || 0);
   return {
     id: Number(row.id),
     text: row.text || "",
@@ -263,9 +272,16 @@ function mapAdminMessage(row) {
     targetMode: row.target_mode || "filtered",
     targetCount: Number(row.target_count || 0),
     filters: row.filters || {},
-    recipientCount: Number(row.recipient_count || row.target_count || 0),
-    sentCount: Number(row.sent_count || 0),
-    failedCount: Number(row.failed_count || 0),
+    status: row.status || "completed",
+    recipientCount,
+    sentCount,
+    failedCount,
+    queuedCount,
+    sendingCount,
+    processedCount: sentCount + failedCount,
+    progressPercent: recipientCount ? Math.round(((sentCount + failedCount) / recipientCount) * 100) : 0,
+    startedAt: row.started_at || null,
+    completedAt: row.completed_at || null,
     createdAt: row.created_at,
   };
 }
@@ -382,7 +398,7 @@ async function getDeposits() {
   return result.rows.map((row) => ({
     id: row.id,
     userId: String(row.user_id),
-    userName: row.username || row.display_name || row.first_name || "User",
+    userName: row.display_name || row.first_name || row.username || "User",
     amount: parseNumber(row.amount),
     timestamp: row.timestamp,
   }));
@@ -421,7 +437,7 @@ async function getReferrals() {
   return result.rows.map((row) => ({
     code: row.code,
     userId: String(row.user_id),
-    userName: row.username || row.display_name || row.first_name || "User",
+    userName: row.display_name || row.first_name || row.username || "User",
     link: row.link,
     shareCount: Number(row.share_count || 0),
     rewardCount: Number(row.reward_count || 0),
@@ -486,7 +502,7 @@ async function getAnalyticsSummary() {
       eventName: row.event_name,
       path: row.path,
       userId: row.user_id ? String(row.user_id) : "",
-      userName: row.username || row.display_name || row.first_name || "Guest",
+      userName: row.display_name || row.first_name || row.username || "Guest",
       createdAt: row.created_at,
     })),
   };
@@ -520,7 +536,9 @@ async function getAdminMessages() {
       m.*,
       COUNT(r.id) AS recipient_count,
       COUNT(r.id) FILTER (WHERE r.status = 'sent') AS sent_count,
-      COUNT(r.id) FILTER (WHERE r.status = 'failed') AS failed_count
+      COUNT(r.id) FILTER (WHERE r.status = 'failed') AS failed_count,
+      COUNT(r.id) FILTER (WHERE r.status = 'pending') AS queued_count,
+      COUNT(r.id) FILTER (WHERE r.status = 'processing') AS sending_count
     FROM admin_messages m
     LEFT JOIN admin_message_recipients r ON r.message_id = m.id
     GROUP BY m.id
@@ -581,51 +599,21 @@ function filterUsersForMessaging(users, filters = {}) {
   });
 }
 
-async function callTelegram(method, payload) {
-  const token = process.env.BOT_TOKEN;
-  const response = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok || data.ok === false) {
-    throw new Error(data.description || `Telegram request failed (${response.status})`);
-  }
-  return data;
-}
-
-function buildWebAppReplyMarkup(buttonText, webAppUrl) {
-  if (!buttonText || !webAppUrl) return undefined;
-  return { inline_keyboard: [[{ text: buttonText, web_app: { url: webAppUrl } }]] };
-}
-
-async function sendTelegramMessage(userId, { text, imageUrl, buttonText, webAppUrl }) {
-  const replyMarkup = buildWebAppReplyMarkup(buttonText, webAppUrl);
-  if (imageUrl) {
-    const caption = text ? text.slice(0, 1024) : undefined;
-    await callTelegram("sendPhoto", {
-      chat_id: String(userId),
-      photo: imageUrl,
-      caption,
-      ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
+async function enqueueBroadcastRecipients(client, messageId, recipients) {
+  const chunkSize = 1000;
+  for (let offset = 0; offset < recipients.length; offset += chunkSize) {
+    const chunk = recipients.slice(offset, offset + chunkSize);
+    const values = [];
+    const placeholders = chunk.map((user, index) => {
+      const base = index * 2;
+      values.push(messageId, user.telegramId);
+      return `($${base + 1}, $${base + 2}, 'pending')`;
     });
-
-    if (text && text.length > 1024) {
-      await callTelegram("sendMessage", {
-        chat_id: String(userId),
-        text,
-        ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
-      });
-    }
-    return;
+    await client.query(`
+      INSERT INTO admin_message_recipients (message_id, user_id, status)
+      VALUES ${placeholders.join(", ")}
+    `, values);
   }
-
-  await callTelegram("sendMessage", {
-    chat_id: String(userId),
-    text,
-    ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
-  });
 }
 
 router.use(requireAdmin);
@@ -684,7 +672,7 @@ router.get("/overview", async (req, res) => {
           ...room,
           playerNames: (room.players || []).map((playerId) => {
             const player = users.find((user) => String(user.telegramId) === String(playerId));
-            return player?.username ? `@${player.username}` : player?.displayName || String(playerId);
+            return player?.displayName || (player?.username ? `@${player.username}` : String(playerId));
           }),
         })),
         analytics: analytics.recentEvents,
@@ -901,10 +889,9 @@ router.post("/messages/send", async (req, res) => {
     const text = cleanString(req.body?.text, 4096);
     const rawImageUrl = cleanString(req.body?.imageUrl, 1200);
     const imageUrl = cleanImageUrl(rawImageUrl);
-    const wantsWebAppButton = req.body?.includeWebAppButton === true;
-    const rawWebAppUrl = cleanString(req.body?.webAppUrl || process.env.WEB_APP_URL, 1200);
-    const webAppUrl = wantsWebAppButton ? cleanWebAppUrl(rawWebAppUrl) : "";
-    const buttonText = wantsWebAppButton ? cleanString(req.body?.buttonText || "Play Carta", 64) : "";
+    const includeWebAppButton = req.body?.includeWebAppButton === true;
+    const webAppUrl = includeWebAppButton ? cleanWebAppUrl(process.env.WEB_APP_URL) : "";
+    const buttonText = includeWebAppButton ? PLAY_BUTTON_TEXT : "";
     const mode = req.body?.mode === "selected" ? "selected" : "filtered";
     const filters = req.body?.filters && typeof req.body.filters === "object" ? req.body.filters : {};
 
@@ -914,8 +901,8 @@ router.post("/messages/send", async (req, res) => {
     if (rawImageUrl && !imageUrl) {
       return res.status(400).json({ success: false, error: "Enter a valid http or https image URL." });
     }
-    if (wantsWebAppButton && (!webAppUrl || !buttonText)) {
-      return res.status(400).json({ success: false, error: "Enter a valid HTTPS Web App URL and button text." });
+    if (includeWebAppButton && !webAppUrl) {
+      return res.status(400).json({ success: false, error: "WEB_APP_URL must be configured as a valid HTTPS URL." });
     }
     if (!process.env.BOT_TOKEN) {
       return res.status(400).json({ success: false, error: "BOT_TOKEN is not configured." });
@@ -931,54 +918,44 @@ router.post("/messages/send", async (req, res) => {
       return res.status(400).json({ success: false, error: "No users matched this message target." });
     }
 
-    const messageResult = await query(
-      `INSERT INTO admin_messages (text, image_url, button_text, web_app_url, target_mode, target_count, filters)
-      VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
-      RETURNING *`,
-      [text, imageUrl, buttonText, webAppUrl, mode, recipients.length, JSON.stringify(filters)]
-    );
-    const message = messageResult.rows[0];
-    const deliveryResults = [];
-
-    for (const user of recipients) {
-      let status = "sent";
-      let deliveryError = "";
-
-      try {
-        await sendTelegramMessage(user.telegramId, { text, imageUrl, buttonText, webAppUrl });
-      } catch (error) {
-        status = "failed";
-        deliveryError = cleanString(error.message, 500);
-      }
-
-      await query(
-        `INSERT INTO admin_message_recipients (message_id, user_id, status, error, sent_at)
-        VALUES ($1, $2, $3, $4, CASE WHEN $3 = 'sent' THEN NOW() ELSE NULL END)`,
-        [message.id, user.telegramId, status, deliveryError]
+    const client = await pool.connect();
+    let message;
+    try {
+      await client.query("BEGIN");
+      const messageResult = await client.query(
+        `INSERT INTO admin_messages (
+          text, image_url, button_text, web_app_url, target_mode, target_count, filters, status
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, 'queued')
+        RETURNING *`,
+        [text, imageUrl, buttonText, webAppUrl, mode, recipients.length, JSON.stringify(filters)]
       );
-
-      deliveryResults.push({
-        userId: user.telegramId,
-        name: user.displayName,
-        status,
-        error: deliveryError,
-      });
+      message = messageResult.rows[0];
+      await enqueueBroadcastRecipients(client, message.id, recipients);
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
     }
 
-    const sentCount = deliveryResults.filter((result) => result.status === "sent").length;
-    const failedCount = deliveryResults.length - sentCount;
-
-    return res.json({
+    console.log(
+      `[broadcast:${message.id}] Queued ${recipients.length} recipient(s) `
+      + `(target: ${mode}, content: ${imageUrl ? "image" : "text"}${text && imageUrl ? "+text" : ""}, `
+      + `web app button: ${includeWebAppButton ? "yes" : "no"}).`
+    );
+    wakeBroadcastWorker();
+    return res.status(202).json({
       success: true,
       message: mapAdminMessage({
         ...message,
-        recipient_count: deliveryResults.length,
-        sent_count: sentCount,
-        failed_count: failedCount,
+        recipient_count: recipients.length,
+        queued_count: recipients.length,
       }),
-      sentCount,
-      failedCount,
-      recipients: deliveryResults,
+      queuedCount: recipients.length,
+      sentCount: 0,
+      failedCount: 0,
     });
   } catch (error) {
     console.error(" /api/admin/messages/send error:", error);

@@ -65,5 +65,8 @@ test("admin content contracts normalize optional fields", () => {
     updatedAt: undefined,
   });
   assert.equal(testUtils.mapDepositNumber({ id: "2" }).phoneNumber, undefined);
-  assert.equal(testUtils.mapAdminMessage({ id: "3" }).targetMode, "filtered");
+  const message = testUtils.mapAdminMessage({ id: "3" });
+  assert.equal(message.targetMode, "filtered");
+  assert.equal(message.status, "completed");
+  assert.equal(message.progressPercent, 0);
 });

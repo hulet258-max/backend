@@ -4,6 +4,7 @@ CREATE TABLE IF NOT EXISTS users (
   username TEXT DEFAULT '',
   display_name TEXT DEFAULT '',
   first_name TEXT DEFAULT '',
+  photo_url TEXT DEFAULT '',
   last_name TEXT DEFAULT '',
   balance NUMERIC(12, 0) NOT NULL DEFAULT 0,
   non_withdrawable_balance NUMERIC(12, 0) NOT NULL DEFAULT 0,
@@ -18,6 +19,7 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS phone TEXT;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS username TEXT DEFAULT '';
 ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name TEXT DEFAULT '';
 ALTER TABLE users ADD COLUMN IF NOT EXISTS first_name TEXT DEFAULT '';
+ALTER TABLE users ADD COLUMN IF NOT EXISTS photo_url TEXT DEFAULT '';
 ALTER TABLE users ADD COLUMN IF NOT EXISTS last_name TEXT DEFAULT '';
 ALTER TABLE users ADD COLUMN IF NOT EXISTS balance NUMERIC(12, 0) NOT NULL DEFAULT 0;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS non_withdrawable_balance NUMERIC(12, 0) NOT NULL DEFAULT 0;
@@ -191,11 +193,18 @@ CREATE TABLE IF NOT EXISTS admin_messages (
   target_mode TEXT NOT NULL DEFAULT 'filtered',
   target_count INTEGER NOT NULL DEFAULT 0,
   filters JSONB NOT NULL DEFAULT '{}'::jsonb,
+  status TEXT NOT NULL DEFAULT 'queued',
+  started_at TIMESTAMPTZ,
+  completed_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 ALTER TABLE admin_messages ADD COLUMN IF NOT EXISTS button_text TEXT NOT NULL DEFAULT '';
 ALTER TABLE admin_messages ADD COLUMN IF NOT EXISTS web_app_url TEXT NOT NULL DEFAULT '';
+ALTER TABLE admin_messages ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'completed';
+ALTER TABLE admin_messages ALTER COLUMN status SET DEFAULT 'queued';
+ALTER TABLE admin_messages ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ;
+ALTER TABLE admin_messages ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ;
 
 CREATE TABLE IF NOT EXISTS admin_message_recipients (
   id BIGSERIAL PRIMARY KEY,
@@ -203,8 +212,17 @@ CREATE TABLE IF NOT EXISTS admin_message_recipients (
   user_id TEXT NOT NULL,
   status TEXT NOT NULL,
   error TEXT NOT NULL DEFAULT '',
+  attempt_count INTEGER NOT NULL DEFAULT 0,
+  delivery_step TEXT NOT NULL DEFAULT 'initial',
+  next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   sent_at TIMESTAMPTZ
 );
 
+ALTER TABLE admin_message_recipients ADD COLUMN IF NOT EXISTS attempt_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE admin_message_recipients ADD COLUMN IF NOT EXISTS delivery_step TEXT NOT NULL DEFAULT 'initial';
+ALTER TABLE admin_message_recipients ADD COLUMN IF NOT EXISTS next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
 CREATE INDEX IF NOT EXISTS idx_admin_message_recipients_message
   ON admin_message_recipients (message_id);
+CREATE INDEX IF NOT EXISTS idx_admin_message_recipients_pending
+  ON admin_message_recipients (status, next_attempt_at, id);

@@ -14,13 +14,13 @@ const {
 
 router.post("/telegram-user", async (req, res) => {
   try {
-    const { telegramId, username, firstName, lastName } = req.body;
+    const { telegramId, username, firstName, lastName, photoUrl } = req.body;
 
     if (!telegramId) {
       return res.status(400).json({ success: false, error: "telegramId missing" });
     }
 
-    const user = await ensureUser(telegramId, { username, firstName, lastName });
+    const user = await ensureUser(telegramId, { username, firstName, lastName, photoUrl });
 
     res.json({ success: true, user });
   } catch (err) {

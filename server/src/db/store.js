@@ -23,9 +23,10 @@ function mapUser(row) {
     telegramId,
     phone: row.phone,
     username: row.username || "",
-    displayName: row.username || row.display_name || row.first_name || "User",
+    displayName: row.display_name || row.first_name || row.username || "User",
     firstName: row.first_name || "",
     lastName: row.last_name || "",
+    photoUrl: row.photo_url || "",
     welcomeGiftSeen: Boolean(row.welcome_gift_seen),
     balance,
     nonWithdrawableBalance,
@@ -42,9 +43,10 @@ function mapPublicUser(row) {
   const telegramId = String(row.telegram_id);
   return {
     telegramId,
-    displayName: row.username || row.display_name || row.first_name || "User",
+    displayName: row.display_name || row.first_name || row.username || "User",
     firstName: row.first_name || "",
     username: row.username || "",
+    photoUrl: row.photo_url || "",
   };
 }
 
@@ -255,18 +257,20 @@ async function ensureUser(telegramId, telegramProfile = {}) {
   const username = String(telegramProfile.username || "").replace(/^@/, "").trim();
   const firstName = String(telegramProfile.firstName || telegramProfile.first_name || "").trim();
   const lastName = String(telegramProfile.lastName || telegramProfile.last_name || "").trim();
+  const photoUrl = String(telegramProfile.photoUrl || telegramProfile.photo_url || "").trim();
   const insertResult = await query(
     `INSERT INTO users (
-      telegram_id, username, first_name, last_name, balance, non_withdrawable_balance, welcome_gift_seen
+      telegram_id, username, first_name, last_name, photo_url, balance, non_withdrawable_balance, welcome_gift_seen
     )
-    VALUES ($1, $2, $3, $4, $5, $5, FALSE)
+    VALUES ($1, $2, $3, $4, $5, $6, $6, FALSE)
     ON CONFLICT (telegram_id) DO UPDATE SET
       username = COALESCE(NULLIF(EXCLUDED.username, ''), users.username),
       first_name = COALESCE(NULLIF(EXCLUDED.first_name, ''), users.first_name),
       last_name = COALESCE(NULLIF(EXCLUDED.last_name, ''), users.last_name),
+      photo_url = COALESCE(NULLIF(EXCLUDED.photo_url, ''), users.photo_url),
       last_seen = NOW()
     RETURNING *, (xmax = 0) AS was_inserted`,
-    [cleanTelegramId, username, firstName, lastName, WELCOME_GIFT_BIRR]
+    [cleanTelegramId, username, firstName, lastName, photoUrl, WELCOME_GIFT_BIRR]
   );
 
   const shouldShowWelcomeGift = !Boolean(insertResult.rows[0]?.welcome_gift_seen);
@@ -305,6 +309,7 @@ async function ensureAppSchemaOnce() {
       display_name TEXT DEFAULT '',
       first_name TEXT DEFAULT '',
       last_name TEXT DEFAULT '',
+      photo_url TEXT DEFAULT '',
       balance NUMERIC(16, 4) NOT NULL DEFAULT 0,
       non_withdrawable_balance NUMERIC(16, 4) NOT NULL DEFAULT 0,
       room_in TEXT,
@@ -319,6 +324,7 @@ async function ensureAppSchemaOnce() {
   await query("ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name TEXT DEFAULT ''");
   await query("ALTER TABLE users ADD COLUMN IF NOT EXISTS first_name TEXT DEFAULT ''");
   await query("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_name TEXT DEFAULT ''");
+  await query("ALTER TABLE users ADD COLUMN IF NOT EXISTS photo_url TEXT DEFAULT ''");
   await query("ALTER TABLE users ADD COLUMN IF NOT EXISTS balance NUMERIC(16, 4) NOT NULL DEFAULT 0");
   await query("ALTER TABLE users ADD COLUMN IF NOT EXISTS non_withdrawable_balance NUMERIC(16, 4) NOT NULL DEFAULT 0");
   await query("ALTER TABLE users ADD COLUMN IF NOT EXISTS room_in TEXT");
@@ -482,7 +488,7 @@ async function updateUserDisplayName(userId, displayName) {
     error.code = "INVALID_DISPLAY_NAME";
     throw error;
   }
-  if (!/^[A-Za-z0-9 _.-]+$/.test(cleanName)) {
+  if (!/^[\p{L}\p{N} _.-]+$/u.test(cleanName)) {
     const error = new Error("Display name can use letters, numbers, spaces, dots, dashes, and underscores.");
     error.code = "INVALID_DISPLAY_NAME";
     throw error;
@@ -512,7 +518,7 @@ async function getPublicUsers(userIds = []) {
   const normalizedIds = [...new Set(userIds.map(String).filter(Boolean))];
   if (!normalizedIds.length) return [];
   const result = await query(
-    "SELECT telegram_id, display_name, username, first_name FROM users WHERE telegram_id = ANY($1::text[])",
+    "SELECT telegram_id, display_name, username, first_name, photo_url FROM users WHERE telegram_id = ANY($1::text[])",
     [normalizedIds]
   );
   return result.rows.map(mapPublicUser);
@@ -634,15 +640,16 @@ async function upsertUser(telegramUser) {
   );
   const result = await query(
     `INSERT INTO users (
-      telegram_id, phone, username, first_name, last_name, balance, non_withdrawable_balance,
+      telegram_id, phone, username, first_name, last_name, photo_url, balance, non_withdrawable_balance,
       room_in, deposit_sum, created_at, last_seen
     )
-    VALUES ($1, $2, $3, $4, $5, COALESCE($6, 0), COALESCE($7, 0), $8, COALESCE($9, 0), COALESCE($10, NOW()), COALESCE($11, NOW()))
+    VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, 0), COALESCE($8, 0), $9, COALESCE($10, 0), COALESCE($11, NOW()), COALESCE($12, NOW()))
     ON CONFLICT (telegram_id) DO UPDATE SET
       phone = EXCLUDED.phone,
       username = EXCLUDED.username,
       first_name = EXCLUDED.first_name,
       last_name = EXCLUDED.last_name,
+      photo_url = COALESCE(NULLIF(EXCLUDED.photo_url, ''), users.photo_url),
       last_seen = NOW()
     RETURNING *`,
     [
@@ -651,6 +658,7 @@ async function upsertUser(telegramUser) {
       telegramUser.username || "",
       telegramUser.firstName || "",
       telegramUser.lastName || "",
+      telegramUser.photoUrl || telegramUser.photo || "",
       initialBalance,
       initialNonWithdrawable,
       telegramUser.roomIn || null,
@@ -1555,6 +1563,10 @@ async function ensureAdminContentTables() {
   `);
   await query("ALTER TABLE admin_messages ADD COLUMN IF NOT EXISTS button_text TEXT NOT NULL DEFAULT ''");
   await query("ALTER TABLE admin_messages ADD COLUMN IF NOT EXISTS web_app_url TEXT NOT NULL DEFAULT ''");
+  await query("ALTER TABLE admin_messages ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'completed'");
+  await query("ALTER TABLE admin_messages ALTER COLUMN status SET DEFAULT 'queued'");
+  await query("ALTER TABLE admin_messages ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ");
+  await query("ALTER TABLE admin_messages ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ");
 
   await query(`
     CREATE TABLE IF NOT EXISTS admin_message_recipients (
@@ -1566,7 +1578,11 @@ async function ensureAdminContentTables() {
       sent_at TIMESTAMPTZ
     )
   `);
+  await query("ALTER TABLE admin_message_recipients ADD COLUMN IF NOT EXISTS attempt_count INTEGER NOT NULL DEFAULT 0");
+  await query("ALTER TABLE admin_message_recipients ADD COLUMN IF NOT EXISTS delivery_step TEXT NOT NULL DEFAULT 'initial'");
+  await query("ALTER TABLE admin_message_recipients ADD COLUMN IF NOT EXISTS next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT NOW()");
   await query("CREATE INDEX IF NOT EXISTS idx_admin_message_recipients_message ON admin_message_recipients (message_id)");
+  await query("CREATE INDEX IF NOT EXISTS idx_admin_message_recipients_pending ON admin_message_recipients (status, next_attempt_at, id)");
 }
 
 function sanitizeBotUsername(value) {
@@ -1686,7 +1702,7 @@ async function awardReferralIfEligible(code, referredUserId) {
       [cleanReferredUserId]
     );
     const referredUser = referredUserResult.rows[0] || {};
-    const referredUserName = referredUser.username || referredUser.display_name || referredUser.first_name || "A new player";
+    const referredUserName = referredUser.display_name || referredUser.first_name || referredUser.username || "A new player";
     const notificationResult = await client.query(
       `INSERT INTO user_notifications (user_id, type, data)
       VALUES ($1, 'referral_reward', $2::jsonb)

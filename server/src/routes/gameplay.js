@@ -116,6 +116,7 @@ const getWinningReason = (analysis) => {
 
 const buildWinnerResult = (redisData, winnerId, analysis = analyzeWinningHand(redisData.playerCards?.[winnerId] || [])) => {
     const winnerCards = redisData.playerCards?.[winnerId] || [];
+    const revealedHands = {};
     const winnerGroups = Object.entries(getRankCounts(winnerCards, true))
         .map(([rank, count]) => ({ rank, count }))
         .sort((a, b) => b.count - a.count);
@@ -123,6 +124,7 @@ const buildWinnerResult = (redisData, winnerId, analysis = analyzeWinningHand(re
     const playerCardCounts = {};
     Object.entries(redisData.playerCards || {}).forEach(([playerId, cards]) => {
         playerCardCounts[playerId] = cards.length;
+        revealedHands[playerId] = cards.map((card) => ({ ...card }));
     });
 
     return {
@@ -131,6 +133,7 @@ const buildWinnerResult = (redisData, winnerId, analysis = analyzeWinningHand(re
         winnerPattern: "4-3-3-1",
         winnerGroups,
         playerCardCounts,
+        revealedHands,
         reason: getWinningReason(analysis),
         jokerCount: analysis.jokerCount,
         jokerBonus: analysis.jokerBonus,
@@ -553,7 +556,8 @@ router.post('/gameplay/play-again', async (req, res) => {
             });
         }
 
-        const nextGameState = createInitialGameState(playerIds);
+        const previousWinnerId = redisData.gameResult?.winnerId;
+        const nextGameState = createInitialGameState(playerIds, previousWinnerId || roomData.creatorId);
         if (redisData.managedBotRoom) {
             biasBotInitialHand(nextGameState, redisData.botProfile?.id || playerIds.find((id) => String(id).startsWith("botgamer:")));
         }
