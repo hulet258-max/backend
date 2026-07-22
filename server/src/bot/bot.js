@@ -2,6 +2,7 @@
 
 const { Telegraf } = require('telegraf');
 const { ensureUser, getReferralLink, getRoom } = require("../db/store");
+const { ADMIN_TELEGRAM_ID, completeAndNotifyWithdrawal } = require("../services/withdrawals");
 
 const GAME_INTRO = [
   "Welcome to Carta!",
@@ -265,24 +266,16 @@ function createBot() {
     }
   });
 
-  bot.action(/^withdraw_sent:(.+):(\d+)$/, async (ctx) => {
+  bot.action(/^withdraw_sent:([A-Za-z0-9_-]{8,80})$/, async (ctx) => {
     try {
-      const userId = String(ctx.match?.[1] || "").trim();
-      const amount = Number(ctx.match?.[2] || 0);
-      const birrAmount = amount;
-
-      if (userId) {
-        await ctx.telegram.sendMessage(
-          userId,
-          [
-            "✅ Withdrawal sent",
-            "",
-            `Your withdrawal request for ${birrAmount} Birr has been marked as sent by admin.`,
-          ].join("\n")
-        );
+      if (String(ctx.from?.id || "") !== ADMIN_TELEGRAM_ID) {
+        return ctx.answerCbQuery("Only the configured admin can complete withdrawals.", { show_alert: true });
       }
 
-      await ctx.answerCbQuery('User notified');
+      const requestId = String(ctx.match?.[1] || "").trim();
+      const result = await completeAndNotifyWithdrawal(requestId, ctx.telegram);
+
+      await ctx.answerCbQuery(result.userNotified ? 'Payment sent and user notified' : 'Payment sent; user notification failed');
       await ctx.editMessageReplyMarkup({
         inline_keyboard: [
           [{ text: 'Done', callback_data: 'withdraw_done' }]

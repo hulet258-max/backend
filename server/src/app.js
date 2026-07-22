@@ -27,6 +27,7 @@ const shareRoutes = require('./api/share');
 const screenshotRecRoutes = require('./api/screenshotrec');
 const joinRoomRoutes = require('./routes/joinRoom');
 const gameplayRoutes = require('./routes/gameplay');
+const { reconcileExpiredRematches } = gameplayRoutes;
 const botGamerRoutes = require('./routes/botgamer');
 const {
   cleanupManagedBotRoomForUser,
@@ -39,6 +40,9 @@ const adminRoutes = require('./routes/admin');
 const settingsRoutes = require('./routes/settings');
 const analyticsRoutes = require('./api/analytics');
 const { emitBalanceUpdates } = require('./services/balanceEvents');
+const { needsManagedRoomEmergencyCleanup } = require('./services/managedRoomLifecycle');
+const { authenticateToken } = require('./services/adminSecurity');
+const { startAdminChangeListener, stopAdminChangeListener } = require('./services/adminReadModel');
 const {
   startBroadcastWorker,
   stopBroadcastWorker,
@@ -58,15 +62,33 @@ const ROOM_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
 const ROOM_CLEANUP_INTERVAL_MS = 60 * 1000;
 const MANAGED_BOT_WAIT_TIMEOUT_MS = 10 * 60 * 1000;
 const BOT_ROOM_RECONCILE_INTERVAL_MS = 15 * 1000;
+const REMATCH_RECONCILE_INTERVAL_MS = 1000;
 const CLEANABLE_ROOM_STATUSES = new Set(['waiting', 'playing', 'ended']);
 
 let started = false;
 let botInstance = null;
 let cleanupInterval = null;
 let botReconcileInterval = null;
+let rematchReconcileInterval = null;
 let counterInterval = null;
 
 app.set('io', io);
+
+io.of('/admin').use(async (socket, next) => {
+  try {
+    const token = socket.handshake.auth?.token || socket.handshake.headers?.authorization?.replace(/^Bearer\s+/i, '');
+    const session = await authenticateToken(token);
+    if (!session) return next(new Error('Admin authentication required.'));
+    socket.admin = session;
+    return next();
+  } catch (error) {
+    return next(new Error('Admin authentication unavailable.'));
+  }
+});
+
+io.of('/admin').on('connection', (socket) => {
+  socket.emit('admin_ready', { connectedAt: new Date().toISOString() });
+});
 
 const getMoneyEventUserIds = (roomStats = {}) => [
   ...Object.keys(roomStats.payouts || {}),
@@ -75,6 +97,7 @@ const getMoneyEventUserIds = (roomStats = {}) => [
 
 function shouldDeleteIdleRoom(roomState, now = Date.now(), timeoutMs = ROOM_IDLE_TIMEOUT_MS) {
   if (!roomState || !CLEANABLE_ROOM_STATUSES.has(String(roomState.status || ''))) return false;
+  if (roomState.status === 'ended' && roomState.rematch?.countdownPaused) return false;
   const lastActivityAt = roomState.lastActivityAt || roomState.createdAt;
   const lastActivityTime = new Date(lastActivityAt || '').getTime();
   return Number.isFinite(lastActivityTime) && now - lastActivityTime >= timeoutMs;
@@ -98,6 +121,12 @@ async function deleteRoomEverywhere(ioInstance, roomId, reason, roomState = null
   await deleteRoom(roomId, reason);
   await redis.del(`room:${roomId}`);
   await redis.del(`room:${roomId}:bot-lock`);
+  await redis.del(`room:${roomId}:bot-start-lock`);
+  await redis.del(`room:${roomId}:turn-action-lock`);
+  await redis.del(`room:${roomId}:declare-win-lock`);
+  await redis.del(`room:${roomId}:rematch-resolve-lock`);
+  const generatedFor = roomState?.generatedFor || roomState?.roomStats?.generatedFor;
+  if (generatedFor) await redis.del(`managed-bot-room:${generatedFor}`);
   await redis.del('rooms:list');
 
   if (ioInstance) {
@@ -138,14 +167,30 @@ async function deleteIdleRooms(ioInstance) {
       }
 
       const lastActivityTime = new Date(lastActivityAt).getTime();
+      if (needsManagedRoomEmergencyCleanup(roomState)) {
+        const reason = Number(roomState.roomStats?.gamesPlayed || 0) >= 6
+          ? 'managed-room-round-cap-violation'
+          : 'managed-room-invalid-playing-state';
+        await deleteRoomEverywhere(ioInstance, roomId, reason, roomState);
+        deletedRoomIds.add(String(roomId));
+        console.error('[cleanup] Removed invalid managed room', {
+          event: 'managed_room_emergency_cleanup',
+          roomId: String(roomId),
+          generatedFor: roomState.generatedFor || null,
+          reason,
+        });
+        continue;
+      }
       if (
         roomState.managedBotRoom &&
         roomState.status === 'waiting' &&
         now - lastActivityTime >= MANAGED_BOT_WAIT_TIMEOUT_MS
       ) {
-        await deleteManagedBotRoom(ioInstance, roomId, roomState.generatedFor);
-        deletedRoomIds.add(String(roomId));
-        continue;
+        const deleted = await deleteManagedBotRoom(ioInstance, roomId, roomState.generatedFor);
+        if (deleted) {
+          deletedRoomIds.add(String(roomId));
+          continue;
+        }
       }
 
       if (!shouldDeleteIdleRoom(roomState, now)) {
@@ -321,6 +366,7 @@ async function startApp(options = {}) {
   try {
     await testConnection();
     await ensureAppSchema();
+    await startAdminChangeListener(io);
     console.log('Postgres schema ready');
 
     await connectRedis();
@@ -334,6 +380,11 @@ async function startApp(options = {}) {
     await deleteIdleRooms(io);
     cleanupInterval = setInterval(() => deleteIdleRooms(io), ROOM_CLEANUP_INTERVAL_MS);
     botReconcileInterval = setInterval(() => reconcileConnectedUsers(io), BOT_ROOM_RECONCILE_INTERVAL_MS);
+    await reconcileExpiredRematches(io);
+    rematchReconcileInterval = setInterval(
+      () => reconcileExpiredRematches(io),
+      REMATCH_RECONCILE_INTERVAL_MS
+    );
 
     await listen(server, port);
     console.log(`Backend + Socket.IO listening on port ${port}`);
@@ -351,24 +402,30 @@ async function startApp(options = {}) {
   } catch (err) {
     started = false;
     await stopBroadcastWorker().catch(() => {});
+    await stopAdminChangeListener().catch(() => {});
     if (counterInterval) clearInterval(counterInterval);
     if (cleanupInterval) clearInterval(cleanupInterval);
     if (botReconcileInterval) clearInterval(botReconcileInterval);
+    if (rematchReconcileInterval) clearInterval(rematchReconcileInterval);
     counterInterval = null;
     cleanupInterval = null;
     botReconcileInterval = null;
+    rematchReconcileInterval = null;
     throw err;
   }
 }
 
 async function stopApp() {
   await stopBroadcastWorker();
+  await stopAdminChangeListener();
   if (counterInterval) clearInterval(counterInterval);
   if (cleanupInterval) clearInterval(cleanupInterval);
   if (botReconcileInterval) clearInterval(botReconcileInterval);
+  if (rematchReconcileInterval) clearInterval(rematchReconcileInterval);
   counterInterval = null;
   cleanupInterval = null;
   botReconcileInterval = null;
+  rematchReconcileInterval = null;
 
   if (botInstance) {
     botInstance.stop('shutdown');

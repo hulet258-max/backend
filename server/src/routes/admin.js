@@ -12,12 +12,35 @@ const {
   finalizeRoomLedger,
   getCommissionRate,
   getRoom,
+  getWithdrawalSummary,
+  getWithdrawalsEnabled,
+  listWithdrawalRequests,
+  setWithdrawalsEnabled,
 } = require("../db/store");
 const { emitBalanceUpdates } = require("../services/balanceEvents");
 const {
   PLAY_BUTTON_TEXT,
   wakeBroadcastWorker,
 } = require("../services/telegramBroadcast");
+const { completeAndNotifyWithdrawal } = require("../services/withdrawals");
+const {
+  bearerToken,
+  clearLoginAttempts,
+  createSession,
+  ensureAdminSecuritySchema,
+  loginAllowed,
+  requireAdmin,
+  revokeSession,
+  verifyCredentials,
+  writeAudit,
+} = require("../services/adminSecurity");
+const {
+  ensureAdminReadModel,
+  getChanges,
+  getMetrics,
+  getProjectedRooms,
+  getProjectedUsers,
+} = require("../services/adminReadModel");
 
 const router = express.Router();
 const adminUploadDirectory = path.join(__dirname, "..", "..", "uploads", "admin");
@@ -68,6 +91,17 @@ function cleanImageUrl(value) {
   }
 }
 
+function cleanOptionalHttpUrl(value) {
+  const url = cleanString(value, 1200);
+  if (!url) return "";
+  try {
+    const parsed = new URL(url);
+    return ["http:", "https:"].includes(parsed.protocol) ? url : "";
+  } catch (error) {
+    return "";
+  }
+}
+
 function cleanWebAppUrl(value) {
   const url = cleanString(value, 1200);
   if (!url) return "";
@@ -78,10 +112,6 @@ function cleanWebAppUrl(value) {
   } catch (error) {
     return "";
   }
-}
-
-function requireAdmin(req, res, next) {
-  return next();
 }
 
 function formatCommissionRate(rate) {
@@ -180,6 +210,9 @@ function normalizeRoomStats(stats = {}) {
     playerFeesPaid: stats.playerFeesPaid || {},
     payouts: stats.payouts || {},
     refunds: stats.refunds || {},
+    leavePenaltyAmount: parseNumber(stats.leavePenaltyAmount),
+    leavePenalties: Array.isArray(stats.leavePenalties) ? stats.leavePenalties : [],
+    lastLeavePenalty: stats.lastLeavePenalty || null,
     topWinnerIds: (stats.topWinnerIds || []).map(String),
     finalizedReason: stats.finalizedReason || null,
     finalizedAt: stats.finalizedAt || null,
@@ -226,6 +259,7 @@ function mapUser(row) {
     createdAt: row.created_at,
     lastSeen: row.last_seen,
     gamesPlayed: Number(row.games_played || 0),
+    wins: Number(row.wins || 0),
     amountPlayed: parseNumber(row.amount_played),
     shareCount: Number(row.share_count || 0),
     rewardCount: Number(row.reward_count || 0),
@@ -238,6 +272,11 @@ function mapPoster(row) {
     id: Number(row.id),
     imageUrl: row.image_url,
     title: row.title || "",
+    platform: row.platform || "",
+    detail: row.detail || "",
+    targetUrl: row.target_url || "",
+    altText: row.alt_text || "",
+    showOverlay: row.show_overlay !== false,
     isActive: Boolean(row.is_active),
     sortOrder: Number(row.sort_order || 0),
     createdAt: row.created_at,
@@ -314,6 +353,7 @@ function summarizeRooms(rooms = []) {
     summary.totalCommission += room.roomStats.commissionAmount;
     summary.totalPayouts += Object.values(room.roomStats.payouts || {}).reduce((sum, value) => sum + parseNumber(value), 0);
     summary.totalRefunds += Object.values(room.roomStats.refunds || {}).reduce((sum, value) => sum + parseNumber(value), 0);
+    summary.totalLeavePenalties += room.roomStats.leavePenaltyAmount;
     return summary;
   }, {
     totalRooms: 0,
@@ -325,59 +365,19 @@ function summarizeRooms(rooms = []) {
     totalCommission: 0,
     totalPayouts: 0,
     totalRefunds: 0,
+    totalLeavePenalties: 0,
     currentRoundPot: 0,
   });
 }
 
 async function getUsers() {
-  const result = await query(`
-    SELECT
-      u.*,
-      COALESCE(ugs.games_played, 0) AS games_played,
-      COALESCE(ugs.amount_played, 0) AS amount_played,
-      COALESCE(ref.share_count, 0) AS share_count,
-      COALESCE(ref.reward_count, 0) AS reward_count,
-      COALESCE(ref.max_rewards, 0) AS max_rewards
-    FROM users u
-    LEFT JOIN user_game_stats ugs ON ugs.user_id = u.telegram_id
-    LEFT JOIN (
-      SELECT
-        user_id,
-        SUM(share_count) AS share_count,
-        SUM(reward_count) AS reward_count,
-        SUM(max_rewards) AS max_rewards
-      FROM referral_links
-      GROUP BY user_id
-    ) ref ON ref.user_id = u.telegram_id
-    WHERE u.telegram_id NOT LIKE 'botgamer:%'
-    ORDER BY u.last_seen DESC
-  `);
-  return result.rows.map(mapUser);
+  const rows = await getProjectedUsers();
+  return rows.map(mapUser);
 }
 
 async function getRooms() {
-  const result = await query(`
-    SELECT *
-    FROM (
-      SELECT
-        id, name, type, entry_fee, stake, creator_id, visibility, created_at,
-        players, player_count, max_players, status, room_stats,
-        FALSE AS is_archived,
-        NULL::TEXT AS archived_reason,
-        NULL::TIMESTAMPTZ AS archived_at
-      FROM rooms
-      UNION ALL
-      SELECT
-        id, name, type, entry_fee, stake, creator_id, visibility, created_at,
-        players, player_count, max_players, status, room_stats,
-        TRUE AS is_archived,
-        archived_reason,
-        archived_at
-      FROM archived_rooms
-    ) room_rows
-    ORDER BY COALESCE(archived_at, created_at) DESC
-  `);
-  return result.rows.map(mapRoom);
+  const rows = await getProjectedRooms();
+  return rows.map(mapRoom);
 }
 
 async function getDeposits() {
@@ -405,11 +405,12 @@ async function getDeposits() {
 }
 
 async function getDepositTotal(queryFn = query) {
-  const result = await queryFn(`
-    SELECT COALESCE(SUM(amount), 0) AS total
-    FROM transactions
-  `);
-  return parseNumber(result.rows[0]?.total);
+  if (queryFn !== query) {
+    const result = await queryFn("SELECT COALESCE(SUM(amount), 0) AS total FROM transactions");
+    return parseNumber(result.rows[0]?.total);
+  }
+  const metrics = await getMetrics();
+  return parseNumber(metrics.total_deposits);
 }
 
 async function getReferrals() {
@@ -616,11 +617,10 @@ async function enqueueBroadcastRecipients(client, messageId, recipients) {
   }
 }
 
-router.use(requireAdmin);
-
 router.use(async (req, res, next) => {
   try {
     await ensureAppSchema();
+    await Promise.all([ensureAdminSecuritySchema(), ensureAdminReadModel()]);
     next();
   } catch (error) {
     console.error("Admin schema check failed:", error);
@@ -628,15 +628,83 @@ router.use(async (req, res, next) => {
   }
 });
 
+router.post("/auth/login", async (req, res) => {
+  if (!loginAllowed(req)) {
+    await writeAudit({ req, action: "auth.login.rate_limited", statusCode: 429 });
+    return res.status(429).json({ success: false, error: "Too many login attempts. Try again later." });
+  }
+  const username = cleanString(req.body?.username, 100);
+  if (!verifyCredentials(username, req.body?.password)) {
+    await writeAudit({ req, action: "auth.login.failed", statusCode: 401, details: { username } });
+    return res.status(401).json({ success: false, error: "Invalid admin login." });
+  }
+  clearLoginAttempts(req);
+  const session = await createSession(username, req);
+  req.admin = { username };
+  await writeAudit({ req, action: "auth.login.succeeded", statusCode: 200 });
+  return res.json({ success: true, token: session.token, expiresAt: session.expiresAt, username });
+});
+
+router.use(requireAdmin);
+
+router.get("/auth/session", (req, res) => res.json({
+  success: true,
+  username: req.admin.username,
+  expiresAt: req.admin.expires_at,
+}));
+
+router.post("/auth/logout", async (req, res) => {
+  await revokeSession(bearerToken(req));
+  await writeAudit({ req, action: "auth.logout", statusCode: 200 });
+  return res.json({ success: true });
+});
+
+router.use((req, res, next) => {
+  if (["GET", "HEAD", "OPTIONS"].includes(req.method)) return next();
+  res.on("finish", () => {
+    writeAudit({
+      req,
+      action: `admin.${req.method.toLowerCase()}`,
+      statusCode: res.statusCode,
+      details: { path: req.path },
+    });
+  });
+  return next();
+});
+
+router.get("/sync/changes", async (req, res) => {
+  try {
+    const result = await getChanges(req.query.after, req.query.limit);
+    const metrics = await getMetrics();
+    return res.json({ success: true, ...result, metrics });
+  } catch (error) {
+    console.error(" /api/admin/sync/changes error:", error);
+    return res.status(500).json({ success: false, error: "Could not load admin changes." });
+  }
+});
+
 router.get("/overview", async (req, res) => {
   try {
-    const [users, rooms, deposits, totalDeposits, referrals, analytics] = await Promise.all([
+    const [
+      users,
+      rooms,
+      deposits,
+      totalDeposits,
+      referrals,
+      analytics,
+      withdrawalSummary,
+      withdrawalsEnabled,
+      metrics,
+    ] = await Promise.all([
       getUsers(),
       getRooms(),
       getDeposits(),
       getDepositTotal(),
       getReferrals(),
       getAnalyticsSummary(),
+      getWithdrawalSummary(),
+      getWithdrawalsEnabled(),
+      getMetrics(),
     ]);
     const roomSummary = summarizeRooms(rooms);
     const totalBalance = users.reduce((sum, user) => sum + user.balance, 0);
@@ -652,8 +720,10 @@ router.get("/overview", async (req, res) => {
         totalUsers: users.length,
         totalBalance,
         totalDeposits,
-        totalWithdrawals: null,
-        withdrawalsTracked: false,
+        totalWithdrawals: withdrawalSummary.totalWithdrawals,
+        pendingWithdrawalCount: withdrawalSummary.pendingWithdrawalCount,
+        withdrawalsTracked: true,
+        withdrawalsEnabled,
         totalReferralRewards,
         activeGames: roomSummary.playing,
         activePlayers: activeRooms.reduce((sum, room) => sum + room.playerCount, 0),
@@ -662,6 +732,22 @@ router.get("/overview", async (req, res) => {
         gamesToday,
         ...analytics,
         ...roomSummary,
+        totalUsers: Number(metrics.total_users || 0),
+        totalBalance: parseNumber(metrics.total_balance),
+        totalDeposits: parseNumber(metrics.total_deposits),
+        totalWithdrawals: parseNumber(metrics.total_withdrawals),
+        pendingWithdrawalCount: Number(metrics.pending_withdrawal_count || 0),
+        totalReferralRewards: parseNumber(metrics.total_referral_rewards),
+        activeGames: Number(metrics.playing || 0),
+        activePlayers: Number(metrics.active_players || 0),
+        waitingRooms: Number(metrics.waiting || 0),
+        totalRooms: Number(metrics.total_rooms || 0),
+        totalGames: Number(metrics.total_games || 0),
+        totalCommission: parseNumber(metrics.total_commission),
+        totalPayouts: parseNumber(metrics.total_payouts),
+        totalRefunds: parseNumber(metrics.total_refunds),
+        totalLeavePenalties: parseNumber(metrics.total_leave_penalties),
+        currentRoundPot: parseNumber(metrics.current_round_pot),
       },
       recent: {
         users: users.slice(0, 8),
@@ -807,30 +893,69 @@ router.delete("/rooms/:roomId", async (req, res) => {
 
 router.get("/money", async (req, res) => {
   try {
-    const [rooms, deposits, totalDeposits] = await Promise.all([
+    const [rooms, deposits, withdrawals, withdrawalsEnabled, metrics] = await Promise.all([
       getRooms(),
       getDeposits(),
-      getDepositTotal(),
+      listWithdrawalRequests(),
+      getWithdrawalsEnabled(),
+      getMetrics(),
     ]);
     const roomSummary = summarizeRooms(rooms);
     return res.json({
       success: true,
       money: {
-        totalDeposits,
-        totalWithdrawals: null,
-        withdrawalsTracked: false,
-        totalCommission: roomSummary.totalCommission,
-        totalPayouts: roomSummary.totalPayouts,
-        totalRefunds: roomSummary.totalRefunds,
-        currentRoundPot: roomSummary.currentRoundPot,
+        totalDeposits: parseNumber(metrics.total_deposits),
+        totalWithdrawals: parseNumber(metrics.total_withdrawals),
+        pendingWithdrawalCount: Number(metrics.pending_withdrawal_count || 0),
+        withdrawalsTracked: true,
+        withdrawalsEnabled,
+        totalCommission: parseNumber(metrics.total_commission),
+        totalLeavePenalties: parseNumber(metrics.total_leave_penalties),
+        totalPayouts: parseNumber(metrics.total_payouts),
+        totalRefunds: parseNumber(metrics.total_refunds),
+        currentRoundPot: parseNumber(metrics.current_round_pot),
       },
       deposits,
-      withdrawals: [],
+      withdrawals,
       games: flattenGames(rooms).sort((a, b) => new Date(b.completedAt || 0) - new Date(a.completedAt || 0)),
     });
   } catch (error) {
     console.error(" /api/admin/money error:", error);
     return res.status(500).json({ success: false, error: "Could not load money data." });
+  }
+});
+
+router.patch("/withdrawals/settings", async (req, res) => {
+  try {
+    if (typeof req.body?.enabled !== "boolean") {
+      return res.status(400).json({ success: false, error: "enabled must be true or false." });
+    }
+    const settings = await setWithdrawalsEnabled(req.body.enabled);
+    return res.json({ success: true, ...settings });
+  } catch (error) {
+    console.error(" /api/admin/withdrawals/settings error:", error);
+    return res.status(500).json({ success: false, error: "Could not update withdrawal settings." });
+  }
+});
+
+router.patch("/withdrawals/:id/status", async (req, res) => {
+  try {
+    if (req.body?.status !== "sent") {
+      return res.status(400).json({ success: false, error: "Only the sent status is supported." });
+    }
+    const result = await completeAndNotifyWithdrawal(req.params.id);
+    return res.json({
+      success: true,
+      withdrawal: result.request,
+      userNotified: result.userNotified,
+      notificationError: result.notificationError || "",
+    });
+  } catch (error) {
+    if (error.message === "WITHDRAWAL_REQUEST_NOT_FOUND") {
+      return res.status(404).json({ success: false, error: "Withdrawal request not found." });
+    }
+    console.error(" /api/admin/withdrawals/:id/status error:", error);
+    return res.status(500).json({ success: false, error: "Could not complete withdrawal request." });
   }
 });
 
@@ -979,14 +1104,24 @@ router.post("/posters", async (req, res) => {
     if (!imageUrl) {
       return res.status(400).json({ success: false, error: "Enter a valid http or https image URL." });
     }
+    const targetUrl = cleanOptionalHttpUrl(req.body?.targetUrl);
+    if (cleanString(req.body?.targetUrl) && !targetUrl) {
+      return res.status(400).json({ success: false, error: "Banner destination must be a valid http or https URL." });
+    }
 
     const result = await query(
-      `INSERT INTO admin_posters (image_url, title, is_active, sort_order)
-      VALUES ($1, $2, $3, $4)
+      `INSERT INTO admin_posters
+        (image_url, title, platform, detail, target_url, alt_text, show_overlay, is_active, sort_order)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
       RETURNING *`,
       [
         imageUrl,
         cleanString(req.body?.title, 120),
+        cleanString(req.body?.platform, 40),
+        cleanString(req.body?.detail, 180),
+        targetUrl,
+        cleanString(req.body?.altText, 180),
+        req.body?.showOverlay !== false,
         req.body?.isActive !== false,
         parseOptionalNumber(req.body?.sortOrder) || 0,
       ]
@@ -1011,13 +1146,24 @@ router.patch("/posters/:id", async (req, res) => {
     if (!nextImageUrl) {
       return res.status(400).json({ success: false, error: "Enter a valid http or https image URL." });
     }
+    const nextTargetUrl = req.body?.targetUrl === undefined
+      ? current.rows[0].target_url
+      : cleanOptionalHttpUrl(req.body.targetUrl);
+    if (req.body?.targetUrl !== undefined && cleanString(req.body.targetUrl) && !nextTargetUrl) {
+      return res.status(400).json({ success: false, error: "Banner destination must be a valid http or https URL." });
+    }
 
     const result = await query(
       `UPDATE admin_posters
       SET image_url = $2,
         title = $3,
-        is_active = $4,
-        sort_order = $5,
+        platform = $4,
+        detail = $5,
+        target_url = $6,
+        alt_text = $7,
+        show_overlay = $8,
+        is_active = $9,
+        sort_order = $10,
         updated_at = NOW()
       WHERE id = $1
       RETURNING *`,
@@ -1025,6 +1171,11 @@ router.patch("/posters/:id", async (req, res) => {
         req.params.id,
         nextImageUrl,
         req.body?.title === undefined ? current.rows[0].title : cleanString(req.body.title, 120),
+        req.body?.platform === undefined ? current.rows[0].platform : cleanString(req.body.platform, 40),
+        req.body?.detail === undefined ? current.rows[0].detail : cleanString(req.body.detail, 180),
+        nextTargetUrl,
+        req.body?.altText === undefined ? current.rows[0].alt_text : cleanString(req.body.altText, 180),
+        req.body?.showOverlay === undefined ? current.rows[0].show_overlay : Boolean(req.body.showOverlay),
         req.body?.isActive === undefined ? current.rows[0].is_active : Boolean(req.body.isActive),
         req.body?.sortOrder === undefined ? current.rows[0].sort_order : (parseOptionalNumber(req.body.sortOrder) || 0),
       ]
@@ -1131,6 +1282,7 @@ router.delete("/deposit-numbers/:id", async (req, res) => {
 
 module.exports = router;
 module.exports.testUtils = {
+  cleanOptionalHttpUrl,
   flattenGames,
   getDepositTotal,
   mapAdminMessage,

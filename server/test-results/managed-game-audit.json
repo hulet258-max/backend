@@ -1,0 +1,108 @@
+{
+  "audit": "managed-game-reliability",
+  "startedAt": "2026-07-17T22:28:15.899Z",
+  "completedAt": "2026-07-17T22:28:18.653Z",
+  "options": {
+    "roomCount": 4,
+    "targetActions": 1,
+    "loadTimeoutMs": 30000,
+    "integrationOnly": false,
+    "loadOnly": false,
+    "smoke": true
+  },
+  "summary": {
+    "checks": 6,
+    "passed": 5,
+    "failed": 1,
+    "critical": 0,
+    "high": 1,
+    "medium": 0,
+    "low": 0
+  },
+  "metrics": {
+    "stateFuzz": {
+      "sequences": 500,
+      "seed": 1729,
+      "actions": 30000,
+      "failures": [],
+      "failureCount": 0
+    }
+  },
+  "findings": [
+    {
+      "id": "MG-001",
+      "severity": "high",
+      "title": "Audit harness completed all requested phases",
+      "details": {
+        "error": "Error: Docker daemon unavailable: WARNING: Error loading config file: open C:\\Users\\balma\\.docker\\config.json: Access is denied.\npermission denied while trying to connect to the docker API at npipe:////./pipe/docker_engine\n    at main (C:\\Users\\balma\\Music\\karta\\backend\\server\\test\\audit\\run-managed-game-audit.js:701:11)\n    at C:\\Users\\balma\\Music\\karta\\backend\\server\\test\\audit\\run-managed-game-audit.js:757:11\n    at Object.<anonymous> (C:\\Users\\balma\\Music\\karta\\backend\\server\\test\\audit\\run-managed-game-audit.js:775:3)\n    at Module._compile (node:internal/modules/cjs/loader:1761:14)\n    at Object..js (node:internal/modules/cjs/loader:1893:10)\n    at Module.load (node:internal/modules/cjs/loader:1481:32)\n    at Module._load (node:internal/modules/cjs/loader:1300:12)\n    at TracingChannel.traceSync (node:diagnostics_channel:328:14)\n    at wrapModuleLoad (node:internal/modules/cjs/loader:245:24)\n    at Module.executeUserEntryPoint [as runMain] (node:internal/modules/run_main:154:5)",
+        "backendLogTail": ""
+      }
+    }
+  ],
+  "checks": [
+    {
+      "name": "Existing backend regression suite",
+      "passed": true,
+      "severity": "medium",
+      "details": {
+        "exitCode": 0,
+        "outputTail": "317ms)\n✔ preserves the entire pot between commission and payout (10.4993ms)\n✔ never takes more commission than the pot (0.3885ms)\n✔ money is Birr-native with no balance conversion (2.5632ms)\n✔ managed bot accounts are funded with 20,000 Birr (0.2483ms)\n✔ new users receive a 10 Birr welcome gift (0.1506ms)\n✔ referrers receive 2 Birr for each eligible referral (0.1116ms)\n✔ paid round commission floor is 1 Birr (0.1431ms)\n✔ room entry fees are at least 10 Birr and multiples of 5 (0.1659ms)\n✔ deals a valid 2-player opening state (14.7575ms)\n✔ deals a valid 3-player opening state (0.4661ms)\n✔ deals a valid 4-player opening state (2.0858ms)\n✔ deals 11 cards to an explicitly selected round starter (0.3257ms)\n✔ bonus introduction latches only through the durable game-stats write (2.1626ms)\n✔ paid settlement increments games for all players and wins only for the human winner (2.5117ms)\n✔ completed managed bonus introductions advance inside settlement (1.325ms)\n✔ getHousePressure softens new players and reacts to rolling WR (4.2306ms)\n✔ perfect-info discard avoids feeding human triple when alternative exists (1.8724ms)\n✔ shouldBotTakeLaid never picks a cold rank (avoids pick→re-lay) (0.6677ms)\n✔ shouldBotTakeLaid can take when bot already holds the rank (0.4342ms)\n✔ chooseDiscardIndex never discards the just-picked card when alternatives exist (0.5217ms)\n✔ decideScriptedOutcome respects legacy numeric target rate (1.7007ms)\n✔ computeScriptedBotWinRate uses games, wins, balance, and fee (3.0213ms)\n✔ decideScriptedOutcome context records factors (0.8385ms)\n✔ pressureForScriptedOutcome maps bot/human scripts (take/give/fair types) (0.4509ms)\n✔ after 6 room games pressure is only fair or take (never give) (0.722ms)\n✔ variable cycles contain shuffled 3/4/5 blocks with nine bot and three human slots (6.6602ms)\n✔ cycle generation prevents a human slot at a human-ended cycle boundary (0.4982ms)\n✔ all variable-cycle positions force nine bot scripts and three human scripts (1.8787ms)\n✔ game block context advances through 12-game variable cycles (0.7934ms)\n✔ new and low-balance players still face high bot script rate (0.4308ms)\n✔ higher lifetime withdrawals raise bot win probability (0.4782ms)\n✔ weakenHumanOpeningHand breaks pairs into cold singletons (10.5775ms)\n✔ biasDeckAgainstPlayer prefers cold ranks for the human (0.3234ms)\n✔ shouldBotTakeLaid always takes self double upgrades (0.1239ms)\n✔ biasDeckForBotDraw only reorders under take (or rare fair) (0.346ms)\n✔ biasBotOpeningHand under take builds toward pairs without finishing win (0.8271ms)\n✔ estimateHandDistance is zero for a winning pattern (0.2295ms)\n✔ buildHouseControlProfile embeds pressure (0.1831ms)\n✔ parseLedger is resilient (7.8741ms)\n✔ legacy fixed ledgers migrate their game count into the variable 12-game cycle (0.3667ms)\n✔ overlapping bot and human slots are invalidated and regenerated (0.344ms)\n✔ recordHouseBotOutcome advances cycles and rolls a fresh variable schedule (1.7928ms)\n✔ managed turn delay has an eight-percent 10-15 second branch (0.326ms)\n✔ managed bonus introduction scripts human, human, bot before normal scheduling (0.2384ms)\n✔ managed leave planning persists one target and one use per 12-game cycle (0.5238ms)\n✔ getMinPicksBeforeWin stays in the configured managed-play window (0.1883ms)\n✔ hasMetMinPlayBeforeWin blocks early finishes and allows after enough picks (0.1721ms)\n✔ hasMetSoftHelpPlayThreshold starts help mid-window, not on the first draws (0.1225ms)\n✔ managed bot min-play window is 5–8 picks (0.0827ms)\n✔ confirmed active-round leave refunds half to the leaver and all to remaining players (4.5071ms)\n✔ half-entry penalty preserves fractional Birr (1.4405ms)\n✔ repeated finalization cannot charge the leave penalty twice (0.7821ms)\n✔ ordinary cleanup still refunds every player in full (0.7056ms)\n✔ opponent timeout refunds the leaver fully and penalizes the inactive player (1.6555ms)\n✔ managed rematch configuration keeps the bot creator and disables recruitment (2.3236ms)\n✔ managed bot remains creator until the room is deleted (4.0036ms)\n✔ departed managed bot room transfers to a private human waiting room (0.9629ms)\n✔ managed room fees follow high-balance bands and replacement minimums (0.4858ms)\n✔ player room payloads hide house-bot control fields (1.5584ms)\n✔ player room payloads hide commission fields while preserving money state (0.8359ms)\n✔ new rematch recruits cannot see the previous round result or cards (1.0489ms)\n✔ sanitizers hide commission fields from all player-facing shapes (0.3008ms)\n✔ completed game payloads preserve revealed final hands (0.2984ms)\n✔ rematch starts a 40-second response window and auto-readies bots (3.7568ms)\n✔ bot games can delay auto-ready so rematch ready waits 1–4s (0.2804ms)\n✔ an incomplete approval window returns the room to the lobby instead of starting a reduced roster (0.4554ms)\n✔ all players agreeing still starts the next round (0.2256ms)\n✔ paused countdown still starts when creator and all others are ready (1.1675ms)\n✔ recruitment pause does not start until a new player joins (0.3293ms)\n✔ paused recruitment does not expire and a joined player gets a fresh countdown (0.3532ms)\n✔ previous-round players stay immutable when a recruit joins (0.2331ms)\n✔ a rematch expires at exactly 40 seconds (0.2384ms)\n✔ removed players cannot remain ready or block the remaining roster (0.417ms)\n[dotenv@17.3.1] injecting env (11) from .env -- tip: ⚙️  enable debug logging with { debug: true }\n[dotenv@17.3.1] injecting env (1) from src\\bot\\.env -- tip: ⚙️  specify custom .env file path with { path: '/custom/path/.env' }\n✔ cleans waiting rooms after 30 minutes without activity (1.8567ms)\n✔ cleans ended rooms after 30 minutes without activity (0.3283ms)\n✔ does not clean unknown room states (0.1467ms)\n✔ does not clean an ended room while creator-controlled recruitment is paused (0.1612ms)\n✔ scripted outcome does not require cards — only player/room context (1.9296ms)\n✔ bot/human scripts map to natural play pressure (0.2323ms)\n✔ allowBotWinDeclare rule: only when scripted bot (0.1666ms)\n✔ system room names preserve the supplied values and duplicates (2.0471ms)\n✔ occupied values exclude every matching duplicate candidate (10.6206ms)\n✔ name exhaustion rolls back without inserting a room (0.9873ms)\n✔ public lobby query hides every full room (1.0318ms)\n✔ personalized lobby hides other full rooms but retains the user's own room (1.0097ms)\n✔ Play now markup always opens the configured Web App (1.9174ms)\n✔ Play now markup is omitted when no Web App button was requested (0.3586ms)\n✔ rate limiter stays below the global limit and spaces calls in one chat (0.5482ms)\n✔ Telegram 429 responses honor retry_after before retrying (0.5293ms)\n✔ text and image broadcasts attach the fixed Play now button (0.6904ms)\n✔ broadcasts without a Web App URL send no inline button (0.3592ms)\n✔ long image broadcasts resume after the saved photo step (0.3745ms)\n✔ turn timeout starts exactly at five minutes (2.3592ms)\n✔ a player cannot use their own inactive turn for a free exit (0.2049ms)\n✔ timeout requires an active participant's current turn (0.161ms)\n✔ valid progress marks turn activity with a server timestamp (0.4079ms)\n✔ legacy rooms fall back to the lay that started the current turn (0.1691ms)\n✔ withdrawals require ten completed games (1.4391ms)\n✔ withdrawals must leave ten Birr in the account (0.2661ms)\n✔ a user with fewer than ten games rolls back without changing balance (3.5231ms)\n✔ a user with exactly ten games can withdraw (1.783ms)\n✔ a withdrawal that leaves exactly ten Birr succeeds (0.8969ms)\n✔ a withdrawal that leaves less than ten Birr rolls back (0.5498ms)\n✔ missing users keep the existing error and rollback behavior (1.1342ms)\n✔ non-withdrawable bonus restrictions still apply after game eligibility (4.607ms)\n✔ locked gift Birr counts toward the retained total balance (0.7203ms)\nℹ tests 123\nℹ suites 0\nℹ pass 123\nℹ fail 0\nℹ cancelled 0\nℹ skipped 0\nℹ todo 0\nℹ duration_ms 1745.6716\n\n"
+      },
+      "at": "2026-07-17T22:28:17.786Z"
+    },
+    {
+      "name": "Room mutations use one serialization boundary",
+      "passed": true,
+      "severity": "high",
+      "details": {
+        "takeCardSerialized": true,
+        "layCardSerialized": true,
+        "risk": "independent read-modify-write requests can overwrite the same Redis room JSON"
+      },
+      "at": "2026-07-17T22:28:17.787Z"
+    },
+    {
+      "name": "Redis lock release verifies token ownership",
+      "passed": true,
+      "severity": "high",
+      "details": {
+        "releaseImplementation": "= async (lock) => {\n    if (!lock?.key) return;\n    await redis.eval(\n        `if redis.call(\"get\", KEYS[1]) == ARGV[1] then\n            return redis.call(\"del\", KEYS[1])\n        end\n        return 0`,\n        { keys: [lock.key], arguments: [lock.token] }\n    );\n};\n\r\n// Helper to fetch current room state from Redis",
+        "risk": "an expired owner can delete a newer owner's lock"
+      },
+      "at": "2026-07-17T22:28:17.787Z"
+    },
+    {
+      "name": "Scheduled bot turns carry a round-generation token",
+      "passed": true,
+      "severity": "high",
+      "details": {
+        "risk": "a timer created for an older round can run during a newer round"
+      },
+      "at": "2026-07-17T22:28:17.787Z"
+    },
+    {
+      "name": "Seeded state fuzz preserves turns, hand sizes, and every card",
+      "passed": true,
+      "severity": "critical",
+      "details": {
+        "sequences": 500,
+        "seed": 1729,
+        "actions": 30000,
+        "failures": [],
+        "failureCount": 0
+      },
+      "at": "2026-07-17T22:28:18.511Z"
+    },
+    {
+      "name": "Audit harness completed all requested phases",
+      "passed": false,
+      "severity": "high",
+      "details": {
+        "error": "Error: Docker daemon unavailable: WARNING: Error loading config file: open C:\\Users\\balma\\.docker\\config.json: Access is denied.\npermission denied while trying to connect to the docker API at npipe:////./pipe/docker_engine\n    at main (C:\\Users\\balma\\Music\\karta\\backend\\server\\test\\audit\\run-managed-game-audit.js:701:11)\n    at C:\\Users\\balma\\Music\\karta\\backend\\server\\test\\audit\\run-managed-game-audit.js:757:11\n    at Object.<anonymous> (C:\\Users\\balma\\Music\\karta\\backend\\server\\test\\audit\\run-managed-game-audit.js:775:3)\n    at Module._compile (node:internal/modules/cjs/loader:1761:14)\n    at Object..js (node:internal/modules/cjs/loader:1893:10)\n    at Module.load (node:internal/modules/cjs/loader:1481:32)\n    at Module._load (node:internal/modules/cjs/loader:1300:12)\n    at TracingChannel.traceSync (node:diagnostics_channel:328:14)\n    at wrapModuleLoad (node:internal/modules/cjs/loader:245:24)\n    at Module.executeUserEntryPoint [as runMain] (node:internal/modules/run_main:154:5)",
+        "backendLogTail": ""
+      },
+      "at": "2026-07-17T22:28:18.649Z"
+    }
+  ],
+  "notes": []
+}

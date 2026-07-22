@@ -5,7 +5,11 @@
   "main": "index.js",
   "scripts": {
     "init:db": "node scripts/initDatabase.js",
-    "test": "node --test test/*.test.js"
+    "test": "node --test test/*.test.js",
+    "test:admin-read-model": "node scripts/verifyAdminRoomTrigger.js",
+    "test:audit": "node test/audit/run-managed-game-audit.js",
+    "test:audit:integration": "node test/audit/run-managed-game-audit.js --integration-only",
+    "test:audit:load": "node test/audit/run-managed-game-audit.js --load-only"
   },
   "keywords": [],
   "author": "",
@@ -21,5 +25,8 @@
     "socket.io": "^4.8.3",
     "telegraf": "^4.16.3",
     "tesseract.js": "^6.0.1"
+  },
+  "devDependencies": {
+    "socket.io-client": "^4.8.3"
   }
 }

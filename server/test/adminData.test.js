@@ -21,6 +21,7 @@ test("admin user contract converts database values to UI-safe values", () => {
     balance: "10",
     deposit_sum: "20.5",
     games_played: "3",
+    wins: "2",
     amount_played: "30",
     share_count: null,
     reward_count: "2",
@@ -31,6 +32,7 @@ test("admin user contract converts database values to UI-safe values", () => {
   assert.equal(user.balance, 10);
   assert.equal(user.depositSum, 20.5);
   assert.equal(user.gamesPlayed, 3);
+  assert.equal(user.wins, 2);
   assert.equal(user.shareCount, 0);
   assert.equal(user.displayName, "User");
 });
@@ -59,6 +61,11 @@ test("admin content contracts normalize optional fields", () => {
     id: 1,
     imageUrl: undefined,
     title: "",
+    platform: "",
+    detail: "",
+    targetUrl: "",
+    altText: "",
+    showOverlay: true,
     isActive: false,
     sortOrder: 0,
     createdAt: undefined,
@@ -69,4 +76,14 @@ test("admin content contracts normalize optional fields", () => {
   assert.equal(message.targetMode, "filtered");
   assert.equal(message.status, "completed");
   assert.equal(message.progressPercent, 0);
+});
+
+test("banner destinations accept only optional http or https URLs", () => {
+  assert.equal(testUtils.cleanOptionalHttpUrl(""), "");
+  assert.equal(
+    testUtils.cleanOptionalHttpUrl("https://instagram.com/carta_game"),
+    "https://instagram.com/carta_game"
+  );
+  assert.equal(testUtils.cleanOptionalHttpUrl("javascript:alert(1)"), "");
+  assert.equal(testUtils.cleanOptionalHttpUrl("not a url"), "");
 });

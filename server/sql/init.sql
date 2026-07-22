@@ -114,9 +114,16 @@ CREATE TABLE IF NOT EXISTS referral_links (
 CREATE TABLE IF NOT EXISTS user_game_stats (
   user_id TEXT PRIMARY KEY REFERENCES users(telegram_id) ON DELETE CASCADE,
   games_played INTEGER NOT NULL DEFAULT 0,
+  wins INTEGER NOT NULL DEFAULT 0,
   amount_played NUMERIC(12, 0) NOT NULL DEFAULT 0,
+  managed_bonus_intro_started BOOLEAN NOT NULL DEFAULT FALSE,
+  managed_bonus_intro_games INTEGER NOT NULL DEFAULT 0,
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+ALTER TABLE user_game_stats ADD COLUMN IF NOT EXISTS wins INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE user_game_stats ADD COLUMN IF NOT EXISTS managed_bonus_intro_started BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE user_game_stats ADD COLUMN IF NOT EXISTS managed_bonus_intro_games INTEGER NOT NULL DEFAULT 0;
 
 CREATE INDEX IF NOT EXISTS idx_referral_links_user_id
   ON referral_links (user_id);
@@ -162,6 +169,11 @@ CREATE TABLE IF NOT EXISTS admin_posters (
   id BIGSERIAL PRIMARY KEY,
   image_url TEXT NOT NULL,
   title TEXT NOT NULL DEFAULT '',
+  platform TEXT NOT NULL DEFAULT '',
+  detail TEXT NOT NULL DEFAULT '',
+  target_url TEXT NOT NULL DEFAULT '',
+  alt_text TEXT NOT NULL DEFAULT '',
+  show_overlay BOOLEAN NOT NULL DEFAULT TRUE,
   is_active BOOLEAN NOT NULL DEFAULT TRUE,
   sort_order INTEGER NOT NULL DEFAULT 0,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),

@@ -24,3 +24,12 @@ test("does not clean unknown room states", () => {
   assert.equal(shouldDeleteIdleRoom({ status: "archived", lastActivityAt: minutesAgo(60) }, NOW), false);
   assert.equal(shouldDeleteIdleRoom({ status: "waiting", lastActivityAt: "invalid" }, NOW), false);
 });
+
+test("does not clean an ended room while creator-controlled recruitment is paused", () => {
+  const now = Date.parse("2026-07-17T10:30:00.000Z");
+  assert.equal(shouldDeleteIdleRoom({
+    status: "ended",
+    lastActivityAt: "2026-07-17T09:00:00.000Z",
+    rematch: { active: true, countdownPaused: true, recruiting: true },
+  }, now), false);
+});

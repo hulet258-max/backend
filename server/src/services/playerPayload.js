@@ -17,7 +17,40 @@ function sanitizeLastSettlement(settlement = null) {
 
 function sanitizeRoomStats(stats = null) {
   if (!stats || typeof stats !== "object") return stats;
-  const clean = withoutKeys(stats, ["commissionAmount", "commissionRate"]);
+  // Hide house-edge knobs from clients (managed bot control).
+  const clean = withoutKeys(stats, [
+    "commissionAmount",
+    "commissionRate",
+    "houseControl",
+    "housePressure",
+    "targetBotWinRate",
+    "botDifficulty",
+    "scriptedWinner",
+    "scriptedBotWins",
+    "scriptedWinnerId",
+    "scriptedBotWinProbability",
+    "scriptedFactors",
+    "scriptedForced",
+    "scriptedGuaranteed",
+    "scriptedForceReason",
+    "roundPressure",
+    "managedBonusIntroStage",
+    "managedLeaveThisRound",
+    "managedLeaveAfterBotTurns",
+    "managedLeaveReplacementFee",
+    "managedRoundContext",
+    "managedRoundContextRevision",
+    "managedBotDeparted",
+    "managedReplacementFee",
+    "cardFlowPlan",
+    "openingPairTarget",
+    "openingPairCalibration",
+    "jokerAssistedRound",
+    "jokerAssistCount",
+    "automatedCallTurnToken",
+    "turnGeneration",
+    "turnToken",
+  ]);
   clean.games = Array.isArray(stats.games) ? stats.games.map(sanitizeGameRecord) : [];
   clean.lastSettlement = sanitizeLastSettlement(stats.lastSettlement);
   return clean;
@@ -38,10 +71,58 @@ function sanitizeRoom(room = null) {
 
 function sanitizeRedisData(redisData = null) {
   if (!redisData || typeof redisData !== "object") return redisData;
+  const clean = withoutKeys(redisData, [
+    "houseControl",
+    "housePressure",
+    "targetBotWinRate",
+    "botDifficulty",
+    "scriptedWinner",
+    "scriptedBotWins",
+    "scriptedWinnerId",
+    "scriptedBotWinProbability",
+    "scriptedFactors",
+    "scriptedForced",
+    "scriptedGuaranteed",
+    "scriptedForceReason",
+    "roundPressure",
+    "botReadyAt",
+    "minPicksBeforeWin",
+    "cardFlowPlan",
+    "openingPairTarget",
+    "openingPairCalibration",
+    "jokerAssistedRound",
+    "jokerAssistCount",
+    "managedBonusIntroStage",
+    "managedLeaveThisRound",
+    "managedLeaveAfterBotTurns",
+    "managedLeaveReplacementFee",
+    "managedRoundContext",
+    "managedRoundContextRevision",
+    "managedBotDeparted",
+    "managedReplacementFee",
+    "automatedCallTurnToken",
+    "turnGeneration",
+    "turnToken",
+  ]);
   return {
-    ...redisData,
+    ...clean,
     roomStats: sanitizeRoomStats(redisData.roomStats),
     gameResult: sanitizeGameResult(redisData.gameResult),
+  };
+}
+
+function sanitizeRedisDataForPlayer(redisData = null, playerId = null) {
+  const clean = sanitizeRedisData(redisData);
+  if (!clean?.rematch?.active || !playerId) return clean;
+  const previousPlayers = (clean.rematch.previousRoundPlayerIds || []).map(String);
+  if (previousPlayers.includes(String(playerId))) return clean;
+  return {
+    ...clean,
+    gameResult: null,
+    playerCards: {},
+    deck: [],
+    laidCards: [],
+    previousRoundSpectator: true,
   };
 }
 
@@ -49,11 +130,13 @@ function sanitizeSettlement(settlement = null) {
   return sanitizeLastSettlement(settlement);
 }
 
-function buildRoomUpdatePayload(room, redisData) {
+function buildRoomUpdatePayload(room, redisData, playerId = null) {
   return {
     room: sanitizeRoom(room),
     players: room?.players || [],
-    redisData: sanitizeRedisData(redisData),
+    redisData: playerId
+      ? sanitizeRedisDataForPlayer(redisData, playerId)
+      : sanitizeRedisData(redisData),
   };
 }
 
@@ -61,6 +144,7 @@ module.exports = {
   buildRoomUpdatePayload,
   sanitizeGameResult,
   sanitizeRedisData,
+  sanitizeRedisDataForPlayer,
   sanitizeRoom,
   sanitizeSettlement,
 };

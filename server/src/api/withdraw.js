@@ -1,18 +1,16 @@
 const express = require("express");
-const { Telegram } = require("telegraf");
 const {
+  DAILY_WITHDRAWAL_LIMIT_BIRR,
+  MIN_REMAINING_BALANCE_BIRR,
   MIN_WITHDRAW_BIRR,
+  MIN_WITHDRAWAL_GAMES,
+  MIN_WITHDRAWAL_PLAY_DAYS,
   isWholeBirrAmount,
 } = require("../config/economy");
 const { withdrawBalance } = require("../db/store");
-const {
-  WITHDRAWAL_WAIT_DAYS,
-  splitRemainingWithdrawalTime,
-} = require("../services/withdrawalPolicy");
+const { notifyAdminOfWithdrawal } = require("../services/withdrawals");
 
 const router = express.Router();
-
-const ADMIN_TELEGRAM_ID = "1303374266";
 
 function toNumber(value) {
   const parsed = Number(value);
@@ -34,6 +32,7 @@ router.post("/withdraw", async (req, res) => {
   try {
     const { telegramId, amount } = req.body;
     const phone = normalizePhone(req.body?.phone);
+    const requestId = String(req.body?.requestId || "").trim();
 
     if (!telegramId) {
       return res.status(400).json({
@@ -49,6 +48,14 @@ router.post("/withdraw", async (req, res) => {
       });
     }
 
+    if (requestId && !/^[A-Za-z0-9_-]{8,80}$/.test(requestId)) {
+      return res.status(400).json({
+        success: false,
+        error: "Invalid withdrawal request ID.",
+        code: "INVALID_WITHDRAWAL_REQUEST_ID",
+      });
+    }
+
     const withdrawAmount = toNumber(amount);
     if (!isWholeBirrAmount(withdrawAmount) || withdrawAmount < MIN_WITHDRAW_BIRR) {
       return res.status(400).json({
@@ -57,32 +64,19 @@ router.post("/withdraw", async (req, res) => {
       });
     }
 
-    const result = await withdrawBalance(telegramId, withdrawAmount, phone);
-
-    if (process.env.BOT_TOKEN) {
-      const telegram = new Telegram(process.env.BOT_TOKEN);
-      const message = [
-        "💸 New Withdraw Request",
-        `User Telegram ID: ${telegramId}`,
-        `Phone: ${result.phone}`,
-        `Withdraw Amount: ${withdrawAmount} Birr`,
-        `Balance After: ${result.nextBalance} Birr`,
-      ].join("\n");
-
-      await telegram.sendMessage(ADMIN_TELEGRAM_ID, message, {
-        reply_markup: {
-          inline_keyboard: [
-            [{ text: "Sent", callback_data: `withdraw_sent:${telegramId}:${withdrawAmount}` }],
-          ],
-        },
-      });
-    } else {
-      console.warn("BOT_TOKEN is missing. Withdraw admin message was not sent.");
+    const result = await withdrawBalance(telegramId, withdrawAmount, phone, { requestId });
+    if (!result.duplicate) {
+      const notification = await notifyAdminOfWithdrawal(result.request);
+      if (!notification.sent) {
+        console.warn("Withdrawal accepted but Telegram admin notification failed:", notification.error);
+      }
     }
 
     return res.json({
       success: true,
-      message: "Withdraw request submitted successfully.",
+      message: "Withdrawal has been sent. It will be completed in less than 24 hours.",
+      request: result.request,
+      duplicate: Boolean(result.duplicate),
       telegramId: String(telegramId),
       withdrawnAmount: withdrawAmount,
       previousBalance: result.currentBalance,
@@ -93,10 +87,28 @@ router.post("/withdraw", async (req, res) => {
       phone: result.phone,
       limits: {
         minWithdraw: MIN_WITHDRAW_BIRR,
-        maxWithdraw: result.nextWithdrawableBalance,
+        maxWithdraw: result.nextMaxWithdraw,
+        gamesRequired: MIN_WITHDRAWAL_GAMES,
+        playDaysRequired: MIN_WITHDRAWAL_PLAY_DAYS,
+        minimumRemainingBalance: MIN_REMAINING_BALANCE_BIRR,
       },
     });
   } catch (error) {
+    if (error.message === "WITHDRAWALS_DISABLED") {
+      return res.status(503).json({
+        success: false,
+        error: "Withdrawals are not available right now. Please try again later.",
+        code: "WITHDRAWALS_DISABLED",
+      });
+    }
+
+    if (error.message === "WITHDRAWAL_REQUEST_CONFLICT") {
+      return res.status(409).json({
+        success: false,
+        error: "This withdrawal request ID was already used for another request.",
+        code: "WITHDRAWAL_REQUEST_CONFLICT",
+      });
+    }
     if (error.message === "USER_NOT_FOUND") {
       return res.status(404).json({
         success: false,
@@ -104,22 +116,44 @@ router.post("/withdraw", async (req, res) => {
       });
     }
 
-    if (error.message === "WITHDRAWAL_ACCOUNT_TOO_NEW") {
-      const remaining = splitRemainingWithdrawalTime(error.remainingSeconds);
-      const eligibleAt = error.eligibleAt instanceof Date
-        ? error.eligibleAt.toISOString()
-        : String(error.eligibleAt);
-      const joinedAt = error.joinedAt instanceof Date
-        ? error.joinedAt.toISOString()
-        : String(error.joinedAt);
-
+    if (error.message === "WITHDRAWAL_DEPOSIT_REQUIRED") {
       return res.status(403).json({
         success: false,
-        error: `Withdrawals are available ${WITHDRAWAL_WAIT_DAYS} days after joining. You can withdraw after ${eligibleAt}.`,
-        code: "WITHDRAWAL_ACCOUNT_TOO_NEW",
-        joinedAt,
-        eligibleAt,
-        ...remaining,
+        error: "Make at least one deposit before withdrawing.",
+        code: "WITHDRAWAL_DEPOSIT_REQUIRED",
+      });
+    }
+
+    if (error.message === "WITHDRAWAL_ACTIVITY_REQUIRED") {
+      return res.status(403).json({
+        success: false,
+        error: `Keep playing before withdrawing. Complete at least ${MIN_WITHDRAWAL_GAMES} games across ${MIN_WITHDRAWAL_PLAY_DAYS} different days.`,
+        code: "WITHDRAWAL_ACTIVITY_REQUIRED",
+        gamesPlayed: error.gamesPlayed,
+        gamesRequired: error.gamesRequired,
+        remainingGames: error.remainingGames,
+        playDays: error.playDays,
+        playDaysRequired: error.playDaysRequired,
+        remainingPlayDays: error.remainingPlayDays,
+      });
+    }
+
+    if (error.message === "WITHDRAWAL_MIN_BALANCE_REQUIRED") {
+      return res.status(400).json({
+        success: false,
+        error: `You must keep at least ${MIN_REMAINING_BALANCE_BIRR} Birr in your balance after withdrawing.`,
+        code: "WITHDRAWAL_MIN_BALANCE_REQUIRED",
+        currentBalance: error.currentBalance,
+        minimumRemainingBalance: error.minimumRemainingBalance,
+        maxWithdraw: error.maxWithdraw,
+      });
+    }
+
+    if (error.message === "WITHDRAWAL_DAILY_LIMIT_EXCEEDED") {
+      return res.status(400).json({
+        success: false,
+        error: `You can only withdraw up to ${DAILY_WITHDRAWAL_LIMIT_BIRR} Birr per day.`,
+        code: "WITHDRAWAL_DAILY_LIMIT_EXCEEDED",
       });
     }
 
@@ -129,6 +163,7 @@ router.post("/withdraw", async (req, res) => {
         error: "This amount includes welcome/share gift Birr, which cannot be withdrawn.",
         withdrawableBalance: error.withdrawableBalance || 0,
         nonWithdrawableBalance: error.nonWithdrawableBalance || 0,
+        maxWithdraw: error.maxWithdraw || 0,
       });
     }
 

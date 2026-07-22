@@ -2,31 +2,23 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 
 const {
-  WITHDRAWAL_WAIT_DAYS,
-  splitRemainingWithdrawalTime,
-} = require("../src/services/withdrawalPolicy");
+  DAILY_WITHDRAWAL_LIMIT_BIRR,
+  MIN_WITHDRAW_BIRR,
+  MIN_REMAINING_BALANCE_BIRR,
+  MIN_WITHDRAWAL_GAMES,
+  MIN_WITHDRAWAL_PLAY_DAYS,
+} = require("../src/config/economy");
 
-test("withdrawals require a 30-day-old account", () => {
-  assert.equal(WITHDRAWAL_WAIT_DAYS, 30);
+test("withdrawals require six completed games across three play days", () => {
+  assert.equal(MIN_WITHDRAWAL_GAMES, 6);
+  assert.equal(MIN_WITHDRAWAL_PLAY_DAYS, 3);
 });
 
-test("remaining withdrawal time is shown as whole days and hours", () => {
-  assert.deepEqual(splitRemainingWithdrawalTime((29 * 24 + 5) * 60 * 60), {
-    remainingDays: 29,
-    remainingHours: 5,
-  });
+test("withdrawals start at ten Birr and must leave twenty Birr in the account", () => {
+  assert.equal(MIN_WITHDRAW_BIRR, 10);
+  assert.equal(MIN_REMAINING_BALANCE_BIRR, 20);
 });
 
-test("a partial remaining hour rounds up so eligibility is not shown early", () => {
-  assert.deepEqual(splitRemainingWithdrawalTime(1), {
-    remainingDays: 0,
-    remainingHours: 1,
-  });
-});
-
-test("eligible accounts have no remaining withdrawal wait", () => {
-  assert.deepEqual(splitRemainingWithdrawalTime(0), {
-    remainingDays: 0,
-    remainingHours: 0,
-  });
+test("withdrawals are capped at two hundred Birr per Ethiopian calendar day", () => {
+  assert.equal(DAILY_WITHDRAWAL_LIMIT_BIRR, 200);
 });
