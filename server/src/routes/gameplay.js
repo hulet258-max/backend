@@ -30,6 +30,10 @@ const {
 } = require("../services/rematch");
 const { buildSocketByUserId, emitBalanceUpdates } = require("../services/balanceEvents");
 const {
+    rotateManagedRoom,
+    shouldWarnForMissingSocket,
+} = require("../services/managedRoomRotation");
+const {
     buildRoomUpdatePayload,
     sanitizeGameResult,
     sanitizeRedisData,
@@ -313,12 +317,26 @@ const saveAndEmitState = async (req, roomId, redisData, currentUserId, currentUs
                     console.log(`Emitting to user ${p.telegramId} via socket: ${p.socketId}`);
                 }
                 io.to(p.socketId).emit("room_update", payload);
-            } else {
+            } else if (shouldWarnForMissingSocket(p.telegramId)) {
                 console.warn(`  -> No socketId found for user ${p.telegramId} in room ${roomId}. Cannot emit update.`);
             }
         });
     }
 };
+
+const rotateManagedRoomSession = (req, roomId, redisData, options = {}) => (
+    rotateManagedRoom({
+        io: req.app.get("io"),
+        redis,
+        roomId,
+        roomState: redisData,
+        requestedUserId: options.requestedUserId,
+        replacementPolicy: options.replacementPolicy,
+        finalizeRoomLedger,
+        deleteRoom,
+        ensureManagedBotRoomForUser,
+    })
+);
 
 const removeRematchPlayer = async (io, roomId, redisData, playerId, reason) => {
     const cleanPlayerId = String(playerId);
@@ -537,6 +555,11 @@ const resolveRematch = async (req, roomId, redisData, { forceDeadline = false } 
     if (requiresManagedRoomRotation(redisData)) {
         redisData.managedRotationRequired = true;
         if (redisData.rematch) redisData.rematch.readyPlayerIds = [];
+        if (forceDeadline) {
+            return rotateManagedRoomSession(req, roomId, redisData, {
+                replacementPolicy: "if-connected",
+            });
+        }
         await saveAndEmitState(req, roomId, redisData);
         return { started: false, rotationRequired: true };
     }
@@ -1164,35 +1187,17 @@ router.post('/gameplay/play-again', async (req, res) => {
         }
         if (requiresManagedRoomRotation(redisData) || redisData.managedRotationRequired) {
             redisData.managedRotationRequired = true;
-            const io = req.app.get("io");
-            if (!isPracticeState(redisData)) {
-                await finalizeRoomLedger(roomId, "managed-room-round-cap");
-            }
-            await deleteRoom(roomId, "managed-room-round-cap");
-            await redis.del(`room:${roomId}`);
-            await redis.del(`room:${roomId}:bot-lock`);
-            await redis.del(`room:${roomId}:bot-start-lock`);
-            await redis.del(`room:${roomId}:turn-action-lock`);
-            await redis.del(`room:${roomId}:declare-win-lock`);
-            await redis.del(`managed-bot-room:${userId}`);
-            await redis.del("rooms:list");
-            io?.emit("room_unavailable", { roomId, reason: "managed-room-round-cap" });
-            io?.emit("room_deleted", { roomId, reason: "managed-room-round-cap" });
-            const replacementRoom = await ensureManagedBotRoomForUser(io, userId, {
-                forceManaged: true,
-            });
-            console.info("[managed-room] rotated", {
-                event: "managed_room_rotated",
-                roomId: String(roomId),
-                userId: String(userId),
-                completedRounds: Number(redisData.roomStats?.gamesPlayed || 0),
-                replacementRoomId: replacementRoom?.id || null,
+            const rotation = await rotateManagedRoomSession(req, roomId, redisData, {
+                requestedUserId: userId,
+                replacementPolicy: "always",
             });
             return res.status(200).json({
                 success: true,
                 roomRotated: true,
                 message: "This room completed its six-round session. A new room is ready.",
-                replacementRoom: replacementRoom ? sanitizeRoom(replacementRoom) : null,
+                replacementRoom: rotation.replacementRoom
+                    ? sanitizeRoom(rotation.replacementRoom)
+                    : null,
             });
         }
         if (Number(feeVersion) !== Number(redisData.rematch.feeVersion || 1)) {
