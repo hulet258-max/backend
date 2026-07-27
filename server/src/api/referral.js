@@ -2,6 +2,7 @@ const express = require("express");
 const router = express.Router();
 const { awardReferralIfEligible, createReferralLink } = require("../db/store");
 const { emitBalanceUpdates } = require("../services/balanceEvents");
+const { redis } = require("../config/redis");
 
 router.post("/referral-link", async (req, res) => {
   try {
@@ -35,6 +36,10 @@ router.post("/referral-open", async (req, res) => {
     const result = await awardReferralIfEligible(code, userId);
     if (result.awarded && result.referrerId) {
       await emitBalanceUpdates(req.app.get("io"), [result.referrerId]);
+      const socketId = redis.isOpen ? await redis.get(`user:${result.referrerId}:socket`) : null;
+      if (socketId && result.notification) {
+        req.app.get("io")?.to(socketId).emit("user_notification", result.notification);
+      }
     }
 
     return res.json({ success: true, ...result });

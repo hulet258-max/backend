@@ -1,0 +1,45 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: karta_test
+      POSTGRES_USER: karta_test
+      POSTGRES_PASSWORD: karta_test
+    ports:
+      - "55432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U karta_test -d karta_test"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    volumes:
+      - audit_postgres_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "yes", "--appendfsync", "always"]
+    ports:
+      - "56379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    volumes:
+      - audit_redis_data:/data
+
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:latest
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "58474:8474"
+      - "55433:5433"
+      - "56380:6380"
+
+volumes:
+  audit_postgres_data:
+  audit_redis_data:

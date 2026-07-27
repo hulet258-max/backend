@@ -1,6 +1,6 @@
 const express = require("express");
 const { query } = require("../config/postgres");
-const { ensureAppSchema } = require("../db/store");
+const { ensureAppSchema, getWithdrawalsEnabled } = require("../db/store");
 
 const router = express.Router();
 
@@ -9,6 +9,11 @@ function mapPoster(row) {
     id: Number(row.id),
     imageUrl: row.image_url,
     title: row.title || "",
+    platform: row.platform || "",
+    detail: row.detail || "",
+    targetUrl: row.target_url || "",
+    altText: row.alt_text || "",
+    showOverlay: row.show_overlay !== false,
     sortOrder: Number(row.sort_order || 0),
   };
 }
@@ -35,7 +40,8 @@ router.use(async (req, res, next) => {
 router.get("/lobby", async (req, res) => {
   try {
     const result = await query(`
-      SELECT id, image_url, title, sort_order
+      SELECT id, image_url, title, platform, detail, target_url, alt_text,
+        show_overlay, sort_order
       FROM admin_posters
       WHERE is_active = TRUE
       ORDER BY sort_order ASC, created_at DESC
@@ -59,6 +65,15 @@ router.get("/deposit-numbers", async (req, res) => {
   } catch (error) {
     console.error(" /api/settings/deposit-numbers error:", error);
     return res.status(500).json({ success: false, error: "Could not load deposit numbers." });
+  }
+});
+
+router.get("/withdrawals", async (_req, res) => {
+  try {
+    return res.json({ success: true, enabled: await getWithdrawalsEnabled() });
+  } catch (error) {
+    console.error(" /api/settings/withdrawals error:", error);
+    return res.status(500).json({ success: false, error: "Could not load withdrawal settings." });
   }
 });
 

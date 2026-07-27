@@ -1,8 +1,8 @@
 // server/src/bot/bot.js
 
 const { Telegraf } = require('telegraf');
-const { COIN_BIRR_VALUE } = require("../config/economy");
 const { ensureUser, getReferralLink, getRoom } = require("../db/store");
+const { ADMIN_TELEGRAM_ID, completeAndNotifyWithdrawal } = require("../services/withdrawals");
 
 const GAME_INTRO = [
   "Welcome to Carta!",
@@ -14,6 +14,7 @@ const GAME_INTRO = [
   "4. When your hand is ready, tap Win to declare it.",
   "",
   "Public and private rooms use Birr; practice games are free.",
+   "for any support, contact @carta_support ",
 ].join("\n");
 
 function buildWebAppUrl(referralCode = "") {
@@ -96,7 +97,7 @@ function buildRoomInlineResult(room, roomUrl, fallbackUrl = "", useWebApp = true
   const roomName = room.name || "Private room";
   const playerCount = Number(room.playerCount || 0);
   const maxPlayers = Number(room.maxPlayers || 0);
-  const entryFee = Number(room.entryFee || 0) * COIN_BIRR_VALUE;
+  const entryFee = Number(room.entryFee || 0);
 
   return {
     type: "article",
@@ -187,7 +188,11 @@ function createBot() {
   bot.start(async (ctx) => {
     const webAppUrl = buildWebAppUrl(ctx.startPayload);
     try {
-      await ensureUser(ctx.from.id);
+      await ensureUser(ctx.from.id, {
+        username: ctx.from.username,
+        firstName: ctx.from.first_name,
+        lastName: ctx.from.last_name,
+      });
     } catch (err) {
       console.error('Bot start user sync error:', err);
     }
@@ -261,24 +266,16 @@ function createBot() {
     }
   });
 
-  bot.action(/^withdraw_sent:(.+):(\d+)$/, async (ctx) => {
+  bot.action(/^withdraw_sent:([A-Za-z0-9_-]{8,80})$/, async (ctx) => {
     try {
-      const userId = String(ctx.match?.[1] || "").trim();
-      const amount = Number(ctx.match?.[2] || 0);
-      const birrAmount = amount * COIN_BIRR_VALUE;
-
-      if (userId) {
-        await ctx.telegram.sendMessage(
-          userId,
-          [
-            "✅ Withdrawal sent",
-            "",
-            `Your withdrawal request for ${birrAmount} Birr has been marked as sent by admin.`,
-          ].join("\n")
-        );
+      if (String(ctx.from?.id || "") !== ADMIN_TELEGRAM_ID) {
+        return ctx.answerCbQuery("Only the configured admin can complete withdrawals.", { show_alert: true });
       }
 
-      await ctx.answerCbQuery('User notified');
+      const requestId = String(ctx.match?.[1] || "").trim();
+      const result = await completeAndNotifyWithdrawal(requestId, ctx.telegram);
+
+      await ctx.answerCbQuery(result.userNotified ? 'Payment sent and user notified' : 'Payment sent; user notification failed');
       await ctx.editMessageReplyMarkup({
         inline_keyboard: [
           [{ text: 'Done', callback_data: 'withdraw_done' }]
@@ -314,11 +311,7 @@ function createBot() {
  * Start bot safely
  */
 async function startBot(bot) {
-  console.log(' Bot started');
   console.log('🤖 Bot started');
-
-  process.once('SIGINT', () => bot.stop('SIGINT'));
-  process.once('SIGTERM', () => bot.stop('SIGTERM'));
 
   await bot.launch();
 }

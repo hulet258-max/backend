@@ -44,19 +44,22 @@ function generateShuffledDeck(playerCount) {
   return deck;
 }
 
-function createInitialGameState(playerIds) {
+function createInitialGameState(playerIds, startingPlayerId = playerIds[0]) {
+  const normalizedStarterId = playerIds.find(
+    (playerId) => String(playerId) === String(startingPlayerId)
+  ) || playerIds[0];
   const deck = generateShuffledDeck(playerIds.length);
   const playerCards = {};
 
   // Deal cards to players
-  playerIds.forEach((playerId, index) => {
-    // Player 1 gets 11 cards, Player 2 gets 10 cards
-    const cardsToDeal = index === 0 ? 11 : 10;
+  playerIds.forEach((playerId) => {
+    // The round starter gets 11 cards so they can lay first; everyone else gets 10.
+    const cardsToDeal = String(playerId) === String(normalizedStarterId) ? 11 : 10;
     playerCards[playerId] = deck.splice(0, cardsToDeal);
   });
 
   return {
-    turn: playerIds[0],       // 1. Whose turn it is
+    turn: normalizedStarterId, // 1. Whose turn it is
     playerCards: playerCards, // 2. Each player's cards
     deck: deck,               // The remaining cards as the deck
     laidCards: []             // 3. Laid cards list

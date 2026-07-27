@@ -4,24 +4,33 @@ CREATE TABLE IF NOT EXISTS users (
   username TEXT DEFAULT '',
   display_name TEXT DEFAULT '',
   first_name TEXT DEFAULT '',
+  photo_url TEXT DEFAULT '',
   last_name TEXT DEFAULT '',
   balance NUMERIC(12, 0) NOT NULL DEFAULT 0,
+  non_withdrawable_balance NUMERIC(12, 0) NOT NULL DEFAULT 0,
   room_in TEXT,
   deposit_sum NUMERIC(12, 0) NOT NULL DEFAULT 0,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  last_seen TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  last_seen TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  welcome_gift_seen BOOLEAN NOT NULL DEFAULT FALSE
 );
 
 ALTER TABLE users ADD COLUMN IF NOT EXISTS phone TEXT;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS username TEXT DEFAULT '';
 ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name TEXT DEFAULT '';
 ALTER TABLE users ADD COLUMN IF NOT EXISTS first_name TEXT DEFAULT '';
+ALTER TABLE users ADD COLUMN IF NOT EXISTS photo_url TEXT DEFAULT '';
 ALTER TABLE users ADD COLUMN IF NOT EXISTS last_name TEXT DEFAULT '';
 ALTER TABLE users ADD COLUMN IF NOT EXISTS balance NUMERIC(12, 0) NOT NULL DEFAULT 0;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS non_withdrawable_balance NUMERIC(12, 0) NOT NULL DEFAULT 0;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS room_in TEXT;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS deposit_sum NUMERIC(12, 0) NOT NULL DEFAULT 0;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
 ALTER TABLE users ADD COLUMN IF NOT EXISTS last_seen TIMESTAMPTZ NOT NULL DEFAULT NOW();
+ALTER TABLE users ADD COLUMN IF NOT EXISTS welcome_gift_seen BOOLEAN;
+UPDATE users SET welcome_gift_seen = TRUE WHERE welcome_gift_seen IS NULL;
+ALTER TABLE users ALTER COLUMN welcome_gift_seen SET DEFAULT FALSE;
+ALTER TABLE users ALTER COLUMN welcome_gift_seen SET NOT NULL;
 
 CREATE TABLE IF NOT EXISTS rooms (
   id TEXT PRIMARY KEY,
@@ -105,9 +114,16 @@ CREATE TABLE IF NOT EXISTS referral_links (
 CREATE TABLE IF NOT EXISTS user_game_stats (
   user_id TEXT PRIMARY KEY REFERENCES users(telegram_id) ON DELETE CASCADE,
   games_played INTEGER NOT NULL DEFAULT 0,
+  wins INTEGER NOT NULL DEFAULT 0,
   amount_played NUMERIC(12, 0) NOT NULL DEFAULT 0,
+  managed_bonus_intro_started BOOLEAN NOT NULL DEFAULT FALSE,
+  managed_bonus_intro_games INTEGER NOT NULL DEFAULT 0,
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+ALTER TABLE user_game_stats ADD COLUMN IF NOT EXISTS wins INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE user_game_stats ADD COLUMN IF NOT EXISTS managed_bonus_intro_started BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE user_game_stats ADD COLUMN IF NOT EXISTS managed_bonus_intro_games INTEGER NOT NULL DEFAULT 0;
 
 CREATE INDEX IF NOT EXISTS idx_referral_links_user_id
   ON referral_links (user_id);
@@ -122,10 +138,42 @@ CREATE TABLE IF NOT EXISTS referral_awards (
   UNIQUE (code, referred_user_id)
 );
 
+CREATE TABLE IF NOT EXISTS user_notifications (
+  id BIGSERIAL PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(telegram_id) ON DELETE CASCADE,
+  type TEXT NOT NULL,
+  data JSONB NOT NULL DEFAULT '{}'::jsonb,
+  read_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_notifications_unread
+  ON user_notifications (user_id, created_at DESC) WHERE read_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS analytics_events (
+  id BIGSERIAL PRIMARY KEY,
+  user_id TEXT,
+  session_id TEXT NOT NULL,
+  event_name TEXT NOT NULL,
+  path TEXT NOT NULL DEFAULT '/',
+  metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_analytics_events_created
+  ON analytics_events (created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_analytics_events_name_created
+  ON analytics_events (event_name, created_at DESC);
+
 CREATE TABLE IF NOT EXISTS admin_posters (
   id BIGSERIAL PRIMARY KEY,
   image_url TEXT NOT NULL,
   title TEXT NOT NULL DEFAULT '',
+  platform TEXT NOT NULL DEFAULT '',
+  detail TEXT NOT NULL DEFAULT '',
+  target_url TEXT NOT NULL DEFAULT '',
+  alt_text TEXT NOT NULL DEFAULT '',
+  show_overlay BOOLEAN NOT NULL DEFAULT TRUE,
   is_active BOOLEAN NOT NULL DEFAULT TRUE,
   sort_order INTEGER NOT NULL DEFAULT 0,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -152,11 +200,23 @@ CREATE TABLE IF NOT EXISTS admin_messages (
   id BIGSERIAL PRIMARY KEY,
   text TEXT NOT NULL DEFAULT '',
   image_url TEXT NOT NULL DEFAULT '',
+  button_text TEXT NOT NULL DEFAULT '',
+  web_app_url TEXT NOT NULL DEFAULT '',
   target_mode TEXT NOT NULL DEFAULT 'filtered',
   target_count INTEGER NOT NULL DEFAULT 0,
   filters JSONB NOT NULL DEFAULT '{}'::jsonb,
+  status TEXT NOT NULL DEFAULT 'queued',
+  started_at TIMESTAMPTZ,
+  completed_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+ALTER TABLE admin_messages ADD COLUMN IF NOT EXISTS button_text TEXT NOT NULL DEFAULT '';
+ALTER TABLE admin_messages ADD COLUMN IF NOT EXISTS web_app_url TEXT NOT NULL DEFAULT '';
+ALTER TABLE admin_messages ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'completed';
+ALTER TABLE admin_messages ALTER COLUMN status SET DEFAULT 'queued';
+ALTER TABLE admin_messages ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ;
+ALTER TABLE admin_messages ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ;
 
 CREATE TABLE IF NOT EXISTS admin_message_recipients (
   id BIGSERIAL PRIMARY KEY,
@@ -164,8 +224,17 @@ CREATE TABLE IF NOT EXISTS admin_message_recipients (
   user_id TEXT NOT NULL,
   status TEXT NOT NULL,
   error TEXT NOT NULL DEFAULT '',
+  attempt_count INTEGER NOT NULL DEFAULT 0,
+  delivery_step TEXT NOT NULL DEFAULT 'initial',
+  next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   sent_at TIMESTAMPTZ
 );
 
+ALTER TABLE admin_message_recipients ADD COLUMN IF NOT EXISTS attempt_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE admin_message_recipients ADD COLUMN IF NOT EXISTS delivery_step TEXT NOT NULL DEFAULT 'initial';
+ALTER TABLE admin_message_recipients ADD COLUMN IF NOT EXISTS next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
 CREATE INDEX IF NOT EXISTS idx_admin_message_recipients_message
   ON admin_message_recipients (message_id);
+CREATE INDEX IF NOT EXISTS idx_admin_message_recipients_pending
+  ON admin_message_recipients (status, next_attempt_at, id);

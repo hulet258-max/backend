@@ -1,10 +1,68 @@
 const express = require("express");
-const { query } = require("../config/postgres");
+const path = require("path");
+const fs = require("fs");
+const { randomUUID } = require("crypto");
+const multer = require("multer");
+const { pool, query } = require("../config/postgres");
 const { redis } = require("../config/redis");
-const { deleteRoom, ensureAppSchema, finalizeRoomLedger, getRoom } = require("../db/store");
+const {
+  calculateCommissionAmount,
+  deleteRoom,
+  ensureAppSchema,
+  finalizeRoomLedger,
+  getCommissionRate,
+  getRoom,
+  getWithdrawalSummary,
+  getWithdrawalsEnabled,
+  listWithdrawalRequests,
+  setWithdrawalsEnabled,
+} = require("../db/store");
 const { emitBalanceUpdates } = require("../services/balanceEvents");
+const {
+  PLAY_BUTTON_TEXT,
+  wakeBroadcastWorker,
+} = require("../services/telegramBroadcast");
+const { completeAndNotifyWithdrawal } = require("../services/withdrawals");
+const {
+  bearerToken,
+  clearLoginAttempts,
+  createSession,
+  ensureAdminSecuritySchema,
+  loginAllowed,
+  requireAdmin,
+  revokeSession,
+  verifyCredentials,
+  writeAudit,
+} = require("../services/adminSecurity");
+const {
+  ensureAdminReadModel,
+  getChanges,
+  getMetrics,
+  getProjectedRooms,
+  getProjectedUsers,
+} = require("../services/adminReadModel");
 
 const router = express.Router();
+const adminUploadDirectory = path.join(__dirname, "..", "..", "uploads", "admin");
+fs.mkdirSync(adminUploadDirectory, { recursive: true });
+const imageUpload = multer({
+  storage: multer.diskStorage({
+    destination: (_req, _file, callback) => callback(null, adminUploadDirectory),
+    filename: (_req, file, callback) => {
+      const extensionByType = {
+        "image/jpeg": ".jpg",
+        "image/png": ".png",
+        "image/webp": ".webp",
+        "image/gif": ".gif",
+      };
+      callback(null, `${randomUUID()}${extensionByType[file.mimetype] || ".img"}`);
+    },
+  }),
+  limits: { fileSize: 8 * 1024 * 1024, files: 1 },
+  fileFilter: (_req, file, callback) => callback(null, [
+    "image/jpeg", "image/png", "image/webp", "image/gif",
+  ].includes(file.mimetype)),
+});
 
 function parseNumber(value) {
   const parsed = Number(value);
@@ -33,33 +91,132 @@ function cleanImageUrl(value) {
   }
 }
 
-function requireAdmin(req, res, next) {
-  return next();
+function cleanOptionalHttpUrl(value) {
+  const url = cleanString(value, 1200);
+  if (!url) return "";
+  try {
+    const parsed = new URL(url);
+    return ["http:", "https:"].includes(parsed.protocol) ? url : "";
+  } catch (error) {
+    return "";
+  }
+}
+
+function cleanWebAppUrl(value) {
+  const url = cleanString(value, 1200);
+  if (!url) return "";
+  try {
+    const parsed = new URL(url);
+    const localHttp = parsed.protocol === "http:" && ["localhost", "127.0.0.1"].includes(parsed.hostname);
+    return parsed.protocol === "https:" || localHttp ? url : "";
+  } catch (error) {
+    return "";
+  }
+}
+
+function formatCommissionRate(rate) {
+  const value = Number(rate || 0);
+  if (!Number.isFinite(value) || value <= 0) return "0%";
+  const percent = value * 100;
+  const fixed = percent.toFixed(2).replace(/\.?0+$/, "");
+  return `${fixed}%`;
+}
+
+function normalizeLastSettlement(settlement = null) {
+  if (!settlement || typeof settlement !== "object") return null;
+  const commissionRate = Number(settlement.commissionRate || 0);
+  return {
+    round: Number(settlement.round || 0),
+    winnerId: settlement.winnerId ? String(settlement.winnerId) : null,
+    roundPot: parseNumber(settlement.roundPot),
+    commissionAmount: parseNumber(settlement.commissionAmount),
+    commissionRate,
+    commissionRateLabel: formatCommissionRate(commissionRate),
+    winnerPayout: parseNumber(settlement.winnerPayout),
+    settledAt: settlement.settledAt || null,
+  };
+}
+
+function normalizeGameRecord(game = {}, room = {}) {
+  const entryFee = parseNumber(game.entryFee ?? room.entryFee ?? room.roomStats?.entryFee);
+  const round = Number(game.round || 0);
+  const roundAmountToWin = parseNumber(game.roundAmountToWin);
+  const fallbackRate = getCommissionRate(entryFee, round || 1);
+  const commissionRate = Number(
+    game.commissionRate != null && Number.isFinite(Number(game.commissionRate))
+      ? game.commissionRate
+      : fallbackRate
+  );
+  let roundCommission = parseNumber(game.roundCommission);
+  // Backfill missing historical commission from pot + rate so admin always sees a cut.
+  if (roundCommission <= 0 && roundAmountToWin > 0) {
+    roundCommission = calculateCommissionAmount(roundAmountToWin, entryFee, round || 1);
+  }
+  let roundPayout = parseNumber(game.roundPayout);
+  if (roundPayout <= 0 && roundAmountToWin > 0) {
+    roundPayout = Math.max(roundAmountToWin - roundCommission, 0);
+  }
+
+  return {
+    round,
+    players: game.players || [],
+    winnerId: game.winnerId || "",
+    entryFee,
+    roundAmountToWin,
+    roundCommission,
+    commissionRate,
+    commissionRateLabel: formatCommissionRate(commissionRate),
+    roundPayout,
+    totalAmountToWin: parseNumber(game.totalAmountToWin),
+    jokerBonus: Boolean(game.jokerBonus),
+    winWeight: parseNumber(game.winWeight || 1),
+    completedAt: game.completedAt || null,
+  };
 }
 
 function normalizeRoomStats(stats = {}) {
+  const entryFee = parseNumber(stats.entryFee);
+  const gamesPlayed = Number(stats.gamesPlayed || 0);
+  const games = Array.isArray(stats.games)
+    ? stats.games.map((game) => normalizeGameRecord(game, { entryFee, roomStats: stats }))
+    : [];
+  const gamesCommissionTotal = games.reduce((sum, game) => sum + parseNumber(game.roundCommission), 0);
+  const storedCommission = parseNumber(stats.commissionAmount);
+  // Prefer stored cumulative house cut; fall back to sum of per-round cuts.
+  const commissionAmount = storedCommission > 0 ? storedCommission : gamesCommissionTotal;
+  const commissionRate = Number(
+    stats.commissionRate != null && Number.isFinite(Number(stats.commissionRate))
+      ? stats.commissionRate
+      : getCommissionRate(entryFee, gamesPlayed)
+  );
+
   return {
-    gamesPlayed: Number(stats.gamesPlayed || 0),
+    gamesPlayed,
     winnerCounts: stats.winnerCounts || {},
     winnerWeights: stats.winnerWeights || {},
-    games: Array.isArray(stats.games) ? stats.games : [],
+    games,
     feeEscrowed: Boolean(stats.feeEscrowed),
     escrowRefunded: Boolean(stats.escrowRefunded),
     escrowSettled: Boolean(stats.escrowSettled),
     escrowPlayers: (stats.escrowPlayers || []).map(String),
     currentRoundPlayers: (stats.currentRoundPlayers || []).map(String),
     currentRoundPot: parseNumber(stats.currentRoundPot),
-    entryFee: parseNumber(stats.entryFee),
+    entryFee,
     totalPot: parseNumber(stats.totalPot),
-    commissionRate: parseNumber(stats.commissionRate),
-    commissionAmount: parseNumber(stats.commissionAmount),
+    commissionRate,
+    commissionRateLabel: formatCommissionRate(commissionRate),
+    commissionAmount,
     roundsEscrowed: Number(stats.roundsEscrowed || 0),
     playerFeesPaid: stats.playerFeesPaid || {},
     payouts: stats.payouts || {},
     refunds: stats.refunds || {},
+    leavePenaltyAmount: parseNumber(stats.leavePenaltyAmount),
+    leavePenalties: Array.isArray(stats.leavePenalties) ? stats.leavePenalties : [],
+    lastLeavePenalty: stats.lastLeavePenalty || null,
     topWinnerIds: (stats.topWinnerIds || []).map(String),
     finalizedReason: stats.finalizedReason || null,
     finalizedAt: stats.finalizedAt || null,
+    lastSettlement: normalizeLastSettlement(stats.lastSettlement),
   };
 }
 
@@ -93,7 +250,7 @@ function mapUser(row) {
     telegramId,
     phone: row.phone || "",
     username: row.username || "",
-    displayName: row.username || row.display_name || row.first_name || "User",
+    displayName: row.display_name || row.first_name || row.username || "User",
     firstName: row.first_name || "",
     lastName: row.last_name || "",
     balance: parseNumber(row.balance),
@@ -102,6 +259,7 @@ function mapUser(row) {
     createdAt: row.created_at,
     lastSeen: row.last_seen,
     gamesPlayed: Number(row.games_played || 0),
+    wins: Number(row.wins || 0),
     amountPlayed: parseNumber(row.amount_played),
     shareCount: Number(row.share_count || 0),
     rewardCount: Number(row.reward_count || 0),
@@ -114,6 +272,11 @@ function mapPoster(row) {
     id: Number(row.id),
     imageUrl: row.image_url,
     title: row.title || "",
+    platform: row.platform || "",
+    detail: row.detail || "",
+    targetUrl: row.target_url || "",
+    altText: row.alt_text || "",
+    showOverlay: row.show_overlay !== false,
     isActive: Boolean(row.is_active),
     sortOrder: Number(row.sort_order || 0),
     createdAt: row.created_at,
@@ -134,39 +297,45 @@ function mapDepositNumber(row) {
 }
 
 function mapAdminMessage(row) {
+  const recipientCount = Number(row.recipient_count || row.target_count || 0);
+  const sentCount = Number(row.sent_count || 0);
+  const failedCount = Number(row.failed_count || 0);
+  const queuedCount = Number(row.queued_count || 0);
+  const sendingCount = Number(row.sending_count || 0);
   return {
     id: Number(row.id),
     text: row.text || "",
     imageUrl: row.image_url || "",
+    buttonText: row.button_text || "",
+    webAppUrl: row.web_app_url || "",
     targetMode: row.target_mode || "filtered",
     targetCount: Number(row.target_count || 0),
     filters: row.filters || {},
-    recipientCount: Number(row.recipient_count || row.target_count || 0),
-    sentCount: Number(row.sent_count || 0),
-    failedCount: Number(row.failed_count || 0),
+    status: row.status || "completed",
+    recipientCount,
+    sentCount,
+    failedCount,
+    queuedCount,
+    sendingCount,
+    processedCount: sentCount + failedCount,
+    progressPercent: recipientCount ? Math.round(((sentCount + failedCount) / recipientCount) * 100) : 0,
+    startedAt: row.started_at || null,
+    completedAt: row.completed_at || null,
     createdAt: row.created_at,
   };
 }
 
 function flattenGames(rooms = []) {
   return rooms.flatMap((room) => (
-    room.roomStats.games.map((game) => ({
+    (room.roomStats.games || []).map((game) => ({
       roomId: room.id,
       roomName: room.name,
       roomStatus: room.status,
       lifecycle: room.lifecycle,
       archivedAt: room.archivedAt,
-      round: Number(game.round || 0),
-      players: game.players || [],
-      winnerId: game.winnerId || "",
-      entryFee: parseNumber(game.entryFee),
-      roundAmountToWin: parseNumber(game.roundAmountToWin),
-      roundCommission: parseNumber(game.roundCommission),
-      roundPayout: parseNumber(game.roundPayout),
-      totalAmountToWin: parseNumber(game.totalAmountToWin),
-      jokerBonus: Boolean(game.jokerBonus),
-      winWeight: parseNumber(game.winWeight || 1),
-      completedAt: game.completedAt || null,
+      entryFee: parseNumber(game.entryFee ?? room.entryFee),
+      roomCommissionTotal: parseNumber(room.roomStats.commissionAmount),
+      ...normalizeGameRecord(game, room),
     }))
   ));
 }
@@ -184,6 +353,7 @@ function summarizeRooms(rooms = []) {
     summary.totalCommission += room.roomStats.commissionAmount;
     summary.totalPayouts += Object.values(room.roomStats.payouts || {}).reduce((sum, value) => sum + parseNumber(value), 0);
     summary.totalRefunds += Object.values(room.roomStats.refunds || {}).reduce((sum, value) => sum + parseNumber(value), 0);
+    summary.totalLeavePenalties += room.roomStats.leavePenaltyAmount;
     return summary;
   }, {
     totalRooms: 0,
@@ -195,58 +365,19 @@ function summarizeRooms(rooms = []) {
     totalCommission: 0,
     totalPayouts: 0,
     totalRefunds: 0,
+    totalLeavePenalties: 0,
     currentRoundPot: 0,
   });
 }
 
 async function getUsers() {
-  const result = await query(`
-    SELECT
-      u.*,
-      COALESCE(ugs.games_played, 0) AS games_played,
-      COALESCE(ugs.amount_played, 0) AS amount_played,
-      COALESCE(ref.share_count, 0) AS share_count,
-      COALESCE(ref.reward_count, 0) AS reward_count,
-      COALESCE(ref.max_rewards, 0) AS max_rewards
-    FROM users u
-    LEFT JOIN user_game_stats ugs ON ugs.user_id = u.telegram_id
-    LEFT JOIN (
-      SELECT
-        user_id,
-        SUM(share_count) AS share_count,
-        SUM(reward_count) AS reward_count,
-        SUM(max_rewards) AS max_rewards
-      FROM referral_links
-      GROUP BY user_id
-    ) ref ON ref.user_id = u.telegram_id
-    ORDER BY u.last_seen DESC
-  `);
-  return result.rows.map(mapUser);
+  const rows = await getProjectedUsers();
+  return rows.map(mapUser);
 }
 
 async function getRooms() {
-  const result = await query(`
-    SELECT *
-    FROM (
-      SELECT
-        id, name, type, entry_fee, stake, creator_id, visibility, created_at,
-        players, player_count, max_players, status, room_stats,
-        FALSE AS is_archived,
-        NULL::TEXT AS archived_reason,
-        NULL::TIMESTAMPTZ AS archived_at
-      FROM rooms
-      UNION ALL
-      SELECT
-        id, name, type, entry_fee, stake, creator_id, visibility, created_at,
-        players, player_count, max_players, status, room_stats,
-        TRUE AS is_archived,
-        archived_reason,
-        archived_at
-      FROM archived_rooms
-    ) room_rows
-    ORDER BY COALESCE(archived_at, created_at) DESC
-  `);
-  return result.rows.map(mapRoom);
+  const rows = await getProjectedRooms();
+  return rows.map(mapRoom);
 }
 
 async function getDeposits() {
@@ -267,10 +398,19 @@ async function getDeposits() {
   return result.rows.map((row) => ({
     id: row.id,
     userId: String(row.user_id),
-    userName: row.username || row.display_name || row.first_name || "User",
+    userName: row.display_name || row.first_name || row.username || "User",
     amount: parseNumber(row.amount),
     timestamp: row.timestamp,
   }));
+}
+
+async function getDepositTotal(queryFn = query) {
+  if (queryFn !== query) {
+    const result = await queryFn("SELECT COALESCE(SUM(amount), 0) AS total FROM transactions");
+    return parseNumber(result.rows[0]?.total);
+  }
+  const metrics = await getMetrics();
+  return parseNumber(metrics.total_deposits);
 }
 
 async function getReferrals() {
@@ -298,7 +438,7 @@ async function getReferrals() {
   return result.rows.map((row) => ({
     code: row.code,
     userId: String(row.user_id),
-    userName: row.username || row.display_name || row.first_name || "User",
+    userName: row.display_name || row.first_name || row.username || "User",
     link: row.link,
     shareCount: Number(row.share_count || 0),
     rewardCount: Number(row.reward_count || 0),
@@ -308,6 +448,65 @@ async function getReferrals() {
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   }));
+}
+
+async function getAnalyticsSummary() {
+  const [totalsResult, eventsResult, pagesResult, dailyResult, recentResult, referralResult] = await Promise.all([
+    query(`
+      SELECT
+        COUNT(DISTINCT session_id) FILTER (WHERE created_at >= NOW() - INTERVAL '24 hours') AS sessions_24h,
+        COUNT(DISTINCT session_id) FILTER (WHERE created_at >= NOW() - INTERVAL '5 minutes') AS live_visitors,
+        COUNT(*) FILTER (WHERE event_name IN ('page_view', 'game_view') AND created_at >= NOW() - INTERVAL '24 hours') AS page_views_24h,
+        COUNT(DISTINCT user_id) FILTER (WHERE user_id IS NOT NULL AND created_at >= NOW() - INTERVAL '24 hours') AS engaged_users_24h,
+        COUNT(*) FILTER (WHERE event_name = 'game_view' AND created_at >= NOW() - INTERVAL '24 hours') AS game_views_24h
+      FROM analytics_events
+    `),
+    query(`
+      SELECT event_name, COUNT(*) AS count
+      FROM analytics_events
+      WHERE created_at >= NOW() - INTERVAL '7 days'
+      GROUP BY event_name ORDER BY count DESC
+    `),
+    query(`
+      SELECT path, COUNT(*) AS views, COUNT(DISTINCT session_id) AS visitors
+      FROM analytics_events
+      WHERE event_name IN ('page_view', 'game_view') AND created_at >= NOW() - INTERVAL '7 days'
+      GROUP BY path ORDER BY views DESC LIMIT 8
+    `),
+    query(`
+      SELECT DATE_TRUNC('day', created_at)::date AS day, COUNT(DISTINCT session_id) AS sessions
+      FROM analytics_events
+      WHERE created_at >= NOW() - INTERVAL '30 days'
+      GROUP BY day ORDER BY day ASC
+    `),
+    query(`
+      SELECT ae.*, u.username, u.display_name, u.first_name
+      FROM analytics_events ae
+      LEFT JOIN users u ON u.telegram_id = ae.user_id
+      ORDER BY ae.created_at DESC LIMIT 20
+    `),
+    query(`SELECT COUNT(*) AS count FROM referral_awards WHERE created_at >= NOW() - INTERVAL '24 hours'`),
+  ]);
+  const totals = totalsResult.rows[0] || {};
+  return {
+    sessions24h: Number(totals.sessions_24h || 0),
+    liveVisitors: Number(totals.live_visitors || 0),
+    pageViews24h: Number(totals.page_views_24h || 0),
+    engagedUsers24h: Number(totals.engaged_users_24h || 0),
+    gameViews24h: Number(totals.game_views_24h || 0),
+    referralConversions24h: Number(referralResult.rows[0]?.count || 0),
+    eventBreakdown: eventsResult.rows.map((row) => ({ name: row.event_name, count: Number(row.count || 0) })),
+    topPages: pagesResult.rows.map((row) => ({ path: row.path, views: Number(row.views || 0), visitors: Number(row.visitors || 0) })),
+    dailyTraffic: dailyResult.rows.map((row) => ({ day: row.day, sessions: Number(row.sessions || 0) })),
+    recentEvents: recentResult.rows.map((row) => ({
+      id: Number(row.id),
+      eventName: row.event_name,
+      path: row.path,
+      userId: row.user_id ? String(row.user_id) : "",
+      userName: row.display_name || row.first_name || row.username || "Guest",
+      createdAt: row.created_at,
+    })),
+  };
 }
 
 async function getPosters(includeInactive = true) {
@@ -338,7 +537,9 @@ async function getAdminMessages() {
       m.*,
       COUNT(r.id) AS recipient_count,
       COUNT(r.id) FILTER (WHERE r.status = 'sent') AS sent_count,
-      COUNT(r.id) FILTER (WHERE r.status = 'failed') AS failed_count
+      COUNT(r.id) FILTER (WHERE r.status = 'failed') AS failed_count,
+      COUNT(r.id) FILTER (WHERE r.status = 'pending') AS queued_count,
+      COUNT(r.id) FILTER (WHERE r.status = 'processing') AS sending_count
     FROM admin_messages m
     LEFT JOIN admin_message_recipients r ON r.message_id = m.id
     GROUP BY m.id
@@ -399,49 +600,27 @@ function filterUsersForMessaging(users, filters = {}) {
   });
 }
 
-async function callTelegram(method, payload) {
-  const token = process.env.BOT_TOKEN;
-  const response = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok || data.ok === false) {
-    throw new Error(data.description || `Telegram request failed (${response.status})`);
-  }
-  return data;
-}
-
-async function sendTelegramMessage(userId, { text, imageUrl }) {
-  if (imageUrl) {
-    const caption = text ? text.slice(0, 1024) : undefined;
-    await callTelegram("sendPhoto", {
-      chat_id: String(userId),
-      photo: imageUrl,
-      caption,
+async function enqueueBroadcastRecipients(client, messageId, recipients) {
+  const chunkSize = 1000;
+  for (let offset = 0; offset < recipients.length; offset += chunkSize) {
+    const chunk = recipients.slice(offset, offset + chunkSize);
+    const values = [];
+    const placeholders = chunk.map((user, index) => {
+      const base = index * 2;
+      values.push(messageId, user.telegramId);
+      return `($${base + 1}, $${base + 2}, 'pending')`;
     });
-
-    if (text && text.length > 1024) {
-      await callTelegram("sendMessage", {
-        chat_id: String(userId),
-        text,
-      });
-    }
-    return;
+    await client.query(`
+      INSERT INTO admin_message_recipients (message_id, user_id, status)
+      VALUES ${placeholders.join(", ")}
+    `, values);
   }
-
-  await callTelegram("sendMessage", {
-    chat_id: String(userId),
-    text,
-  });
 }
-
-router.use(requireAdmin);
 
 router.use(async (req, res, next) => {
   try {
     await ensureAppSchema();
+    await Promise.all([ensureAdminSecuritySchema(), ensureAdminReadModel()]);
     next();
   } catch (error) {
     console.error("Admin schema check failed:", error);
@@ -449,18 +628,91 @@ router.use(async (req, res, next) => {
   }
 });
 
+router.post("/auth/login", async (req, res) => {
+  if (!loginAllowed(req)) {
+    await writeAudit({ req, action: "auth.login.rate_limited", statusCode: 429 });
+    return res.status(429).json({ success: false, error: "Too many login attempts. Try again later." });
+  }
+  const username = cleanString(req.body?.username, 100);
+  if (!verifyCredentials(username, req.body?.password)) {
+    await writeAudit({ req, action: "auth.login.failed", statusCode: 401, details: { username } });
+    return res.status(401).json({ success: false, error: "Invalid admin login." });
+  }
+  clearLoginAttempts(req);
+  const session = await createSession(username, req);
+  req.admin = { username };
+  await writeAudit({ req, action: "auth.login.succeeded", statusCode: 200 });
+  return res.json({ success: true, token: session.token, expiresAt: session.expiresAt, username });
+});
+
+router.use(requireAdmin);
+
+router.get("/auth/session", (req, res) => res.json({
+  success: true,
+  username: req.admin.username,
+  expiresAt: req.admin.expires_at,
+}));
+
+router.post("/auth/logout", async (req, res) => {
+  await revokeSession(bearerToken(req));
+  await writeAudit({ req, action: "auth.logout", statusCode: 200 });
+  return res.json({ success: true });
+});
+
+router.use((req, res, next) => {
+  if (["GET", "HEAD", "OPTIONS"].includes(req.method)) return next();
+  res.on("finish", () => {
+    writeAudit({
+      req,
+      action: `admin.${req.method.toLowerCase()}`,
+      statusCode: res.statusCode,
+      details: { path: req.path },
+    });
+  });
+  return next();
+});
+
+router.get("/sync/changes", async (req, res) => {
+  try {
+    const result = await getChanges(req.query.after, req.query.limit);
+    const metrics = await getMetrics();
+    return res.json({ success: true, ...result, metrics });
+  } catch (error) {
+    console.error(" /api/admin/sync/changes error:", error);
+    return res.status(500).json({ success: false, error: "Could not load admin changes." });
+  }
+});
+
 router.get("/overview", async (req, res) => {
   try {
-    const [users, rooms, deposits, referrals] = await Promise.all([
+    const [
+      users,
+      rooms,
+      deposits,
+      totalDeposits,
+      referrals,
+      analytics,
+      withdrawalSummary,
+      withdrawalsEnabled,
+      metrics,
+    ] = await Promise.all([
       getUsers(),
       getRooms(),
       getDeposits(),
+      getDepositTotal(),
       getReferrals(),
+      getAnalyticsSummary(),
+      getWithdrawalSummary(),
+      getWithdrawalsEnabled(),
+      getMetrics(),
     ]);
     const roomSummary = summarizeRooms(rooms);
     const totalBalance = users.reduce((sum, user) => sum + user.balance, 0);
-    const totalDeposits = deposits.reduce((sum, deposit) => sum + deposit.amount, 0);
     const totalReferralRewards = referrals.reduce((sum, referral) => sum + referral.totalAwarded, 0);
+    const activeRooms = rooms.filter((room) => !room.isArchived && room.status === "playing");
+    const now = Date.now();
+    const newUsers24h = users.filter((user) => now - new Date(user.createdAt).getTime() <= 24 * 60 * 60 * 1000).length;
+    const gamesToday = flattenGames(rooms).filter((game) => now - new Date(game.completedAt).getTime() <= 24 * 60 * 60 * 1000).length;
 
     return res.json({
       success: true,
@@ -468,17 +720,48 @@ router.get("/overview", async (req, res) => {
         totalUsers: users.length,
         totalBalance,
         totalDeposits,
-        totalWithdrawals: null,
-        withdrawalsTracked: false,
+        totalWithdrawals: withdrawalSummary.totalWithdrawals,
+        pendingWithdrawalCount: withdrawalSummary.pendingWithdrawalCount,
+        withdrawalsTracked: true,
+        withdrawalsEnabled,
         totalReferralRewards,
         activeGames: roomSummary.playing,
+        activePlayers: activeRooms.reduce((sum, room) => sum + room.playerCount, 0),
+        waitingRooms: roomSummary.waiting,
+        newUsers24h,
+        gamesToday,
+        ...analytics,
         ...roomSummary,
+        totalUsers: Number(metrics.total_users || 0),
+        totalBalance: parseNumber(metrics.total_balance),
+        totalDeposits: parseNumber(metrics.total_deposits),
+        totalWithdrawals: parseNumber(metrics.total_withdrawals),
+        pendingWithdrawalCount: Number(metrics.pending_withdrawal_count || 0),
+        totalReferralRewards: parseNumber(metrics.total_referral_rewards),
+        activeGames: Number(metrics.playing || 0),
+        activePlayers: Number(metrics.active_players || 0),
+        waitingRooms: Number(metrics.waiting || 0),
+        totalRooms: Number(metrics.total_rooms || 0),
+        totalGames: Number(metrics.total_games || 0),
+        totalCommission: parseNumber(metrics.total_commission),
+        totalPayouts: parseNumber(metrics.total_payouts),
+        totalRefunds: parseNumber(metrics.total_refunds),
+        totalLeavePenalties: parseNumber(metrics.total_leave_penalties),
+        currentRoundPot: parseNumber(metrics.current_round_pot),
       },
       recent: {
         users: users.slice(0, 8),
         rooms: rooms.slice(0, 8),
         deposits: deposits.slice(0, 8),
         referrals: referrals.slice(0, 8),
+        activeGames: activeRooms.map((room) => ({
+          ...room,
+          playerNames: (room.players || []).map((playerId) => {
+            const player = users.find((user) => String(user.telegramId) === String(playerId));
+            return player?.displayName || (player?.username ? `@${player.username}` : String(playerId));
+          }),
+        })),
+        analytics: analytics.recentEvents,
       },
     });
   } catch (error) {
@@ -494,6 +777,68 @@ router.get("/users", async (req, res) => {
   } catch (error) {
     console.error(" /api/admin/users error:", error);
     return res.status(500).json({ success: false, error: "Could not load users." });
+  }
+});
+
+router.delete("/users/:userId", async (req, res) => {
+  try {
+    const userId = String(req.params.userId || "").trim();
+    if (!userId) {
+      return res.status(400).json({ success: false, error: "Missing user ID." });
+    }
+
+    const userResult = await query("SELECT * FROM users WHERE telegram_id = $1", [userId]);
+    if (!userResult.rows[0]) {
+      return res.status(404).json({ success: false, error: "User not found." });
+    }
+
+    const roomResult = await query(
+      "SELECT id FROM rooms WHERE creator_id = $1 OR players @> ARRAY[$1::text]",
+      [userId]
+    );
+    const deletedRoomIds = [];
+    const balanceUpdateIds = new Set();
+
+    for (const row of roomResult.rows) {
+      const roomId = String(row.id);
+      const roomStats = await finalizeRoomLedger(roomId, "admin-user-deleted");
+      Object.keys(roomStats?.payouts || {}).forEach((id) => balanceUpdateIds.add(id));
+      Object.keys(roomStats?.refunds || {}).forEach((id) => balanceUpdateIds.add(id));
+      await deleteRoom(roomId, "admin-user-deleted");
+
+      if (redis.isOpen) {
+        await redis.del(`room:${roomId}`);
+        await redis.del(`room:${roomId}:bot-lock`);
+      }
+      deletedRoomIds.push(roomId);
+    }
+
+    await query("DELETE FROM users WHERE telegram_id = $1", [userId]);
+
+    if (redis.isOpen) {
+      await redis.del(`user:${userId}:socket`);
+      await redis.del(`managed-bot-room:${userId}`);
+      await redis.del("rooms:list");
+    }
+
+    const io = req.app.get("io");
+    await emitBalanceUpdates(io, [...balanceUpdateIds].filter((id) => id !== userId));
+    if (io) {
+      deletedRoomIds.forEach((roomId) => {
+        io.emit("room_unavailable", { roomId });
+        io.emit("room_deleted", { roomId });
+      });
+    }
+
+    return res.json({
+      success: true,
+      message: "User deleted.",
+      deletedUserId: userId,
+      deletedRoomIds,
+    });
+  } catch (error) {
+    console.error(" /api/admin/users/:userId delete error:", error);
+    return res.status(500).json({ success: false, error: "Could not delete user." });
   }
 });
 
@@ -548,26 +893,69 @@ router.delete("/rooms/:roomId", async (req, res) => {
 
 router.get("/money", async (req, res) => {
   try {
-    const [rooms, deposits] = await Promise.all([getRooms(), getDeposits()]);
+    const [rooms, deposits, withdrawals, withdrawalsEnabled, metrics] = await Promise.all([
+      getRooms(),
+      getDeposits(),
+      listWithdrawalRequests(),
+      getWithdrawalsEnabled(),
+      getMetrics(),
+    ]);
     const roomSummary = summarizeRooms(rooms);
     return res.json({
       success: true,
       money: {
-        totalDeposits: deposits.reduce((sum, deposit) => sum + deposit.amount, 0),
-        totalWithdrawals: null,
-        withdrawalsTracked: false,
-        totalCommission: roomSummary.totalCommission,
-        totalPayouts: roomSummary.totalPayouts,
-        totalRefunds: roomSummary.totalRefunds,
-        currentRoundPot: roomSummary.currentRoundPot,
+        totalDeposits: parseNumber(metrics.total_deposits),
+        totalWithdrawals: parseNumber(metrics.total_withdrawals),
+        pendingWithdrawalCount: Number(metrics.pending_withdrawal_count || 0),
+        withdrawalsTracked: true,
+        withdrawalsEnabled,
+        totalCommission: parseNumber(metrics.total_commission),
+        totalLeavePenalties: parseNumber(metrics.total_leave_penalties),
+        totalPayouts: parseNumber(metrics.total_payouts),
+        totalRefunds: parseNumber(metrics.total_refunds),
+        currentRoundPot: parseNumber(metrics.current_round_pot),
       },
       deposits,
-      withdrawals: [],
+      withdrawals,
       games: flattenGames(rooms).sort((a, b) => new Date(b.completedAt || 0) - new Date(a.completedAt || 0)),
     });
   } catch (error) {
     console.error(" /api/admin/money error:", error);
     return res.status(500).json({ success: false, error: "Could not load money data." });
+  }
+});
+
+router.patch("/withdrawals/settings", async (req, res) => {
+  try {
+    if (typeof req.body?.enabled !== "boolean") {
+      return res.status(400).json({ success: false, error: "enabled must be true or false." });
+    }
+    const settings = await setWithdrawalsEnabled(req.body.enabled);
+    return res.json({ success: true, ...settings });
+  } catch (error) {
+    console.error(" /api/admin/withdrawals/settings error:", error);
+    return res.status(500).json({ success: false, error: "Could not update withdrawal settings." });
+  }
+});
+
+router.patch("/withdrawals/:id/status", async (req, res) => {
+  try {
+    if (req.body?.status !== "sent") {
+      return res.status(400).json({ success: false, error: "Only the sent status is supported." });
+    }
+    const result = await completeAndNotifyWithdrawal(req.params.id);
+    return res.json({
+      success: true,
+      withdrawal: result.request,
+      userNotified: result.userNotified,
+      notificationError: result.notificationError || "",
+    });
+  } catch (error) {
+    if (error.message === "WITHDRAWAL_REQUEST_NOT_FOUND") {
+      return res.status(404).json({ success: false, error: "Withdrawal request not found." });
+    }
+    console.error(" /api/admin/withdrawals/:id/status error:", error);
+    return res.status(500).json({ success: false, error: "Could not complete withdrawal request." });
   }
 });
 
@@ -600,11 +988,35 @@ router.get("/messages", async (req, res) => {
   }
 });
 
+router.post("/uploads/image", (req, res) => {
+  imageUpload.single("image")(req, res, (error) => {
+    if (error) {
+      const message = error.code === "LIMIT_FILE_SIZE"
+        ? "Image must be 8 MB or smaller."
+        : "Could not upload this image.";
+      return res.status(400).json({ success: false, error: message });
+    }
+    if (!req.file) {
+      return res.status(400).json({ success: false, error: "Select a JPG, PNG, WebP, or GIF image." });
+    }
+    const configuredOrigin = cleanString(process.env.API_PUBLIC_URL || process.env.PUBLIC_BASE_URL, 1200).replace(/\/$/, "");
+    const forwardedProtocol = cleanString(req.get("x-forwarded-proto"), 20).split(",")[0] || req.protocol;
+    const origin = configuredOrigin || `${forwardedProtocol}://${req.get("host")}`;
+    return res.status(201).json({
+      success: true,
+      imageUrl: `${origin}/uploads/admin/${encodeURIComponent(req.file.filename)}`,
+    });
+  });
+});
+
 router.post("/messages/send", async (req, res) => {
   try {
     const text = cleanString(req.body?.text, 4096);
     const rawImageUrl = cleanString(req.body?.imageUrl, 1200);
     const imageUrl = cleanImageUrl(rawImageUrl);
+    const includeWebAppButton = req.body?.includeWebAppButton === true;
+    const webAppUrl = includeWebAppButton ? cleanWebAppUrl(process.env.WEB_APP_URL) : "";
+    const buttonText = includeWebAppButton ? PLAY_BUTTON_TEXT : "";
     const mode = req.body?.mode === "selected" ? "selected" : "filtered";
     const filters = req.body?.filters && typeof req.body.filters === "object" ? req.body.filters : {};
 
@@ -613,6 +1025,9 @@ router.post("/messages/send", async (req, res) => {
     }
     if (rawImageUrl && !imageUrl) {
       return res.status(400).json({ success: false, error: "Enter a valid http or https image URL." });
+    }
+    if (includeWebAppButton && !webAppUrl) {
+      return res.status(400).json({ success: false, error: "WEB_APP_URL must be configured as a valid HTTPS URL." });
     }
     if (!process.env.BOT_TOKEN) {
       return res.status(400).json({ success: false, error: "BOT_TOKEN is not configured." });
@@ -628,54 +1043,44 @@ router.post("/messages/send", async (req, res) => {
       return res.status(400).json({ success: false, error: "No users matched this message target." });
     }
 
-    const messageResult = await query(
-      `INSERT INTO admin_messages (text, image_url, target_mode, target_count, filters)
-      VALUES ($1, $2, $3, $4, $5::jsonb)
-      RETURNING *`,
-      [text, imageUrl, mode, recipients.length, JSON.stringify(filters)]
-    );
-    const message = messageResult.rows[0];
-    const deliveryResults = [];
-
-    for (const user of recipients) {
-      let status = "sent";
-      let deliveryError = "";
-
-      try {
-        await sendTelegramMessage(user.telegramId, { text, imageUrl });
-      } catch (error) {
-        status = "failed";
-        deliveryError = cleanString(error.message, 500);
-      }
-
-      await query(
-        `INSERT INTO admin_message_recipients (message_id, user_id, status, error, sent_at)
-        VALUES ($1, $2, $3, $4, CASE WHEN $3 = 'sent' THEN NOW() ELSE NULL END)`,
-        [message.id, user.telegramId, status, deliveryError]
+    const client = await pool.connect();
+    let message;
+    try {
+      await client.query("BEGIN");
+      const messageResult = await client.query(
+        `INSERT INTO admin_messages (
+          text, image_url, button_text, web_app_url, target_mode, target_count, filters, status
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, 'queued')
+        RETURNING *`,
+        [text, imageUrl, buttonText, webAppUrl, mode, recipients.length, JSON.stringify(filters)]
       );
-
-      deliveryResults.push({
-        userId: user.telegramId,
-        name: user.displayName,
-        status,
-        error: deliveryError,
-      });
+      message = messageResult.rows[0];
+      await enqueueBroadcastRecipients(client, message.id, recipients);
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
     }
 
-    const sentCount = deliveryResults.filter((result) => result.status === "sent").length;
-    const failedCount = deliveryResults.length - sentCount;
-
-    return res.json({
+    console.log(
+      `[broadcast:${message.id}] Queued ${recipients.length} recipient(s) `
+      + `(target: ${mode}, content: ${imageUrl ? "image" : "text"}${text && imageUrl ? "+text" : ""}, `
+      + `web app button: ${includeWebAppButton ? "yes" : "no"}).`
+    );
+    wakeBroadcastWorker();
+    return res.status(202).json({
       success: true,
       message: mapAdminMessage({
         ...message,
-        recipient_count: deliveryResults.length,
-        sent_count: sentCount,
-        failed_count: failedCount,
+        recipient_count: recipients.length,
+        queued_count: recipients.length,
       }),
-      sentCount,
-      failedCount,
-      recipients: deliveryResults,
+      queuedCount: recipients.length,
+      sentCount: 0,
+      failedCount: 0,
     });
   } catch (error) {
     console.error(" /api/admin/messages/send error:", error);
@@ -699,14 +1104,24 @@ router.post("/posters", async (req, res) => {
     if (!imageUrl) {
       return res.status(400).json({ success: false, error: "Enter a valid http or https image URL." });
     }
+    const targetUrl = cleanOptionalHttpUrl(req.body?.targetUrl);
+    if (cleanString(req.body?.targetUrl) && !targetUrl) {
+      return res.status(400).json({ success: false, error: "Banner destination must be a valid http or https URL." });
+    }
 
     const result = await query(
-      `INSERT INTO admin_posters (image_url, title, is_active, sort_order)
-      VALUES ($1, $2, $3, $4)
+      `INSERT INTO admin_posters
+        (image_url, title, platform, detail, target_url, alt_text, show_overlay, is_active, sort_order)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
       RETURNING *`,
       [
         imageUrl,
         cleanString(req.body?.title, 120),
+        cleanString(req.body?.platform, 40),
+        cleanString(req.body?.detail, 180),
+        targetUrl,
+        cleanString(req.body?.altText, 180),
+        req.body?.showOverlay !== false,
         req.body?.isActive !== false,
         parseOptionalNumber(req.body?.sortOrder) || 0,
       ]
@@ -731,13 +1146,24 @@ router.patch("/posters/:id", async (req, res) => {
     if (!nextImageUrl) {
       return res.status(400).json({ success: false, error: "Enter a valid http or https image URL." });
     }
+    const nextTargetUrl = req.body?.targetUrl === undefined
+      ? current.rows[0].target_url
+      : cleanOptionalHttpUrl(req.body.targetUrl);
+    if (req.body?.targetUrl !== undefined && cleanString(req.body.targetUrl) && !nextTargetUrl) {
+      return res.status(400).json({ success: false, error: "Banner destination must be a valid http or https URL." });
+    }
 
     const result = await query(
       `UPDATE admin_posters
       SET image_url = $2,
         title = $3,
-        is_active = $4,
-        sort_order = $5,
+        platform = $4,
+        detail = $5,
+        target_url = $6,
+        alt_text = $7,
+        show_overlay = $8,
+        is_active = $9,
+        sort_order = $10,
         updated_at = NOW()
       WHERE id = $1
       RETURNING *`,
@@ -745,6 +1171,11 @@ router.patch("/posters/:id", async (req, res) => {
         req.params.id,
         nextImageUrl,
         req.body?.title === undefined ? current.rows[0].title : cleanString(req.body.title, 120),
+        req.body?.platform === undefined ? current.rows[0].platform : cleanString(req.body.platform, 40),
+        req.body?.detail === undefined ? current.rows[0].detail : cleanString(req.body.detail, 180),
+        nextTargetUrl,
+        req.body?.altText === undefined ? current.rows[0].alt_text : cleanString(req.body.altText, 180),
+        req.body?.showOverlay === undefined ? current.rows[0].show_overlay : Boolean(req.body.showOverlay),
         req.body?.isActive === undefined ? current.rows[0].is_active : Boolean(req.body.isActive),
         req.body?.sortOrder === undefined ? current.rows[0].sort_order : (parseOptionalNumber(req.body.sortOrder) || 0),
       ]
@@ -850,3 +1281,15 @@ router.delete("/deposit-numbers/:id", async (req, res) => {
 });
 
 module.exports = router;
+module.exports.testUtils = {
+  cleanOptionalHttpUrl,
+  flattenGames,
+  getDepositTotal,
+  mapAdminMessage,
+  mapDepositNumber,
+  mapPoster,
+  mapRoom,
+  mapUser,
+  normalizeGameRecord,
+  summarizeRooms,
+};

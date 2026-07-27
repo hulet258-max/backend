@@ -4,7 +4,7 @@ require('dotenv').config({ path: path.join(__dirname, 'bot', '.env') });
 
 const express = require('express');
 const cors = require('cors');
-const http = require('http'); // for Socket.IO
+const http = require('http');
 const { Server } = require('socket.io');
 
 const { testConnection } = require('./config/postgres');
@@ -27,30 +27,83 @@ const shareRoutes = require('./api/share');
 const screenshotRecRoutes = require('./api/screenshotrec');
 const joinRoomRoutes = require('./routes/joinRoom');
 const gameplayRoutes = require('./routes/gameplay');
+const { reconcileExpiredRematches } = gameplayRoutes;
 const botGamerRoutes = require('./routes/botgamer');
 const {
   cleanupManagedBotRoomForUser,
   deleteManagedBotRoom,
   ensureManagedBotRoomForUser,
   reconcileConnectedUsers,
+  scheduleBotTurn,
 } = botGamerRoutes;
 const adminRoutes = require('./routes/admin');
 const settingsRoutes = require('./routes/settings');
+const analyticsRoutes = require('./api/analytics');
 const { emitBalanceUpdates } = require('./services/balanceEvents');
+const { needsManagedRoomEmergencyCleanup } = require('./services/managedRoomLifecycle');
+const { authenticateToken } = require('./services/adminSecurity');
+const { startAdminChangeListener, stopAdminChangeListener } = require('./services/adminReadModel');
+const {
+  startBroadcastWorker,
+  stopBroadcastWorker,
+} = require('./services/telegramBroadcast');
 
 const app = express();
+const server = http.createServer(app);
+const io = new Server(server, {
+  cors: {
+    origin: '*',
+    methods: ['GET', 'POST'],
+  },
+});
+
 const PORT = process.env.PORT || 8000;
 const ROOM_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
 const ROOM_CLEANUP_INTERVAL_MS = 60 * 1000;
 const MANAGED_BOT_WAIT_TIMEOUT_MS = 10 * 60 * 1000;
 const BOT_ROOM_RECONCILE_INTERVAL_MS = 15 * 1000;
+const REMATCH_RECONCILE_INTERVAL_MS = 1000;
+const CLEANABLE_ROOM_STATUSES = new Set(['waiting', 'playing', 'ended']);
+
+let started = false;
+let botInstance = null;
+let cleanupInterval = null;
+let botReconcileInterval = null;
+let rematchReconcileInterval = null;
+let counterInterval = null;
+
+app.set('io', io);
+
+io.of('/admin').use(async (socket, next) => {
+  try {
+    const token = socket.handshake.auth?.token || socket.handshake.headers?.authorization?.replace(/^Bearer\s+/i, '');
+    const session = await authenticateToken(token);
+    if (!session) return next(new Error('Admin authentication required.'));
+    socket.admin = session;
+    return next();
+  } catch (error) {
+    return next(new Error('Admin authentication unavailable.'));
+  }
+});
+
+io.of('/admin').on('connection', (socket) => {
+  socket.emit('admin_ready', { connectedAt: new Date().toISOString() });
+});
 
 const getMoneyEventUserIds = (roomStats = {}) => [
   ...Object.keys(roomStats.payouts || {}),
   ...Object.keys(roomStats.refunds || {}),
 ];
 
-async function deleteRoomEverywhere(io, roomId, reason, roomState = null, roomData = null) {
+function shouldDeleteIdleRoom(roomState, now = Date.now(), timeoutMs = ROOM_IDLE_TIMEOUT_MS) {
+  if (!roomState || !CLEANABLE_ROOM_STATUSES.has(String(roomState.status || ''))) return false;
+  if (roomState.status === 'ended' && roomState.rematch?.countdownPaused) return false;
+  const lastActivityAt = roomState.lastActivityAt || roomState.createdAt;
+  const lastActivityTime = new Date(lastActivityAt || '').getTime();
+  return Number.isFinite(lastActivityTime) && now - lastActivityTime >= timeoutMs;
+}
+
+async function deleteRoomEverywhere(ioInstance, roomId, reason, roomState = null, roomData = null) {
   const room = roomData || await getRoom(roomId);
   const isPracticeRoom = Boolean(
     roomState?.practice ||
@@ -61,23 +114,30 @@ async function deleteRoomEverywhere(io, roomId, reason, roomState = null, roomDa
   let roomStats = null;
   if (room && !isPracticeRoom) {
     roomStats = await finalizeRoomLedger(roomId, reason);
-    await emitBalanceUpdates(io, getMoneyEventUserIds(roomStats));
+    console.log('[settlement] room finalized', { roomId, reason, roomStats });
+    await emitBalanceUpdates(ioInstance, getMoneyEventUserIds(roomStats));
   }
 
   await deleteRoom(roomId, reason);
   await redis.del(`room:${roomId}`);
   await redis.del(`room:${roomId}:bot-lock`);
+  await redis.del(`room:${roomId}:bot-start-lock`);
+  await redis.del(`room:${roomId}:turn-action-lock`);
+  await redis.del(`room:${roomId}:declare-win-lock`);
+  await redis.del(`room:${roomId}:rematch-resolve-lock`);
+  const generatedFor = roomState?.generatedFor || roomState?.roomStats?.generatedFor;
+  if (generatedFor) await redis.del(`managed-bot-room:${generatedFor}`);
   await redis.del('rooms:list');
 
-  if (io) {
-    io.emit('room_unavailable', { roomId });
-    io.emit('room_deleted', { roomId });
+  if (ioInstance) {
+    ioInstance.emit('room_unavailable', { roomId });
+    ioInstance.emit('room_deleted', { roomId });
   }
 
   return roomStats;
 }
 
-async function deleteIdleRooms(io) {
+async function deleteIdleRooms(ioInstance) {
   if (!redis.isOpen) return;
 
   try {
@@ -106,22 +166,39 @@ async function deleteIdleRooms(io) {
         continue;
       }
 
-      const lastActivityTime = lastActivityAt ? new Date(lastActivityAt).getTime() : now;
+      const lastActivityTime = new Date(lastActivityAt).getTime();
+      if (needsManagedRoomEmergencyCleanup(roomState)) {
+        const reason = Number(roomState.roomStats?.gamesPlayed || 0) >= 6
+          ? 'managed-room-round-cap-violation'
+          : 'managed-room-invalid-playing-state';
+        await deleteRoomEverywhere(ioInstance, roomId, reason, roomState);
+        deletedRoomIds.add(String(roomId));
+        console.error('[cleanup] Removed invalid managed room', {
+          event: 'managed_room_emergency_cleanup',
+          roomId: String(roomId),
+          generatedFor: roomState.generatedFor || null,
+          reason,
+        });
+        continue;
+      }
       if (
         roomState.managedBotRoom &&
         roomState.status === 'waiting' &&
         now - lastActivityTime >= MANAGED_BOT_WAIT_TIMEOUT_MS
       ) {
-        await deleteManagedBotRoom(io, roomId, roomState.generatedFor);
-        deletedRoomIds.add(String(roomId));
-        continue;
+        const deleted = await deleteManagedBotRoom(ioInstance, roomId, roomState.generatedFor);
+        if (deleted) {
+          deletedRoomIds.add(String(roomId));
+          continue;
+        }
       }
-      if (!Number.isFinite(lastActivityTime) || now - lastActivityTime < ROOM_IDLE_TIMEOUT_MS) {
+
+      if (!shouldDeleteIdleRoom(roomState, now)) {
         continue;
       }
 
       const reason = roomState.practice ? 'practice-idle-cleanup' : 'idle-cleanup';
-      await deleteRoomEverywhere(io, roomId, reason, roomState);
+      await deleteRoomEverywhere(ioInstance, roomId, reason, roomState);
       deletedRoomIds.add(String(roomId));
       console.log(`[cleanup] Deleted idle room ${roomId} after 30 minutes without play.`);
     }
@@ -136,7 +213,7 @@ async function deleteIdleRooms(io) {
       if (redisState) continue;
 
       const reason = room.roomStats?.practice ? 'practice-orphan-cleanup' : 'orphan-idle-cleanup';
-      await deleteRoomEverywhere(io, roomId, reason, null, room);
+      await deleteRoomEverywhere(ioInstance, roomId, reason, null, room);
       deletedRoomIds.add(roomId);
       console.log(`[cleanup] Deleted orphan active room ${roomId} with no Redis game state.`);
     }
@@ -145,11 +222,10 @@ async function deleteIdleRooms(io) {
   }
 }
 
-// Middlewares
 app.use(cors());
 app.use(express.json());
+app.use('/uploads', express.static(path.join(__dirname, '..', 'uploads')));
 
-// API routes
 app.use('/api', userRoutes);
 app.use('/api', createRoomRoutes);
 app.use('/api', depositRoutes);
@@ -160,163 +236,225 @@ app.use('/api', screenshotRecRoutes);
 app.use('/api', joinRoomRoutes);
 app.use('/api', gameplayRoutes);
 app.use('/api', botGamerRoutes);
+app.use('/api', analyticsRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/settings', settingsRoutes);
 
-// Health check
 app.get('/health', async (req, res) => {
   try {
     await testConnection();
     await ensureAppSchema();
-    const redisStatus = redis.isOpen ? "connected" : "disconnected";
 
     res.json({
       status: 'ok',
       postgres: 'connected',
-      redis: redisStatus,
-      time: new Date()
+      redis: redis.isOpen ? 'connected' : 'disconnected',
+      time: new Date(),
     });
   } catch (err) {
     console.error('Health check DB error:', err);
     res.status(500).json({
       status: 'error',
       postgres: 'disconnected',
-      redis: redis.isOpen ? "connected" : "disconnected",
-      error: err.message
+      redis: redis.isOpen ? 'connected' : 'disconnected',
+      error: err.message,
     });
   }
 });
 
-// Start app
-async function startApp() {
+io.on('connection', (socket) => {
+  console.log('New client connected:', socket.id);
+
+  socket.on('auth_user', async (telegramId) => {
+    if (!telegramId) return;
+
+    try {
+      await redis.set(`user:${telegramId}:socket`, socket.id);
+      await ensureManagedBotRoomForUser(io, telegramId);
+      console.log(`[socket] User ${telegramId} connected with socket ${socket.id}`);
+    } catch (error) {
+      console.error('Redis Error:', error);
+    }
+  });
+
+  socket.on('call_player', async (payload = {}) => {
+    try {
+      const roomId = String(payload.roomId || '').trim();
+      const fromUserId = String(payload.fromUserId || '').trim();
+      const targetUserId = String(payload.targetUserId || '').trim();
+      if (!roomId || !fromUserId || !targetUserId) return;
+
+      const rawRoomState = await redis.get(`room:${roomId}`);
+      if (!rawRoomState) return;
+      const roomState = JSON.parse(rawRoomState);
+      const players = roomState.players || [];
+      const fromPlayer = players.find((player) => String(player.telegramId) === fromUserId);
+      const targetPlayer = players.find((player) => String(player.telegramId) === targetUserId);
+      if (!fromPlayer || !targetPlayer) return;
+
+      const callPayload = {
+        roomId,
+        fromUserId,
+        targetUserId,
+        at: new Date().toISOString(),
+        nonce: `${Date.now()}-${Math.random()}`,
+      };
+      roomState.lastCall = callPayload;
+      await redis.set(`room:${roomId}`, JSON.stringify(roomState));
+
+      if (targetPlayer.socketId) {
+        io.to(targetPlayer.socketId).emit('player_call', callPayload);
+      } else if (String(targetUserId).startsWith('botgamer:')) {
+        scheduleBotTurn({ app }, roomId);
+      }
+    } catch (error) {
+      console.error('Player call relay error:', error);
+    }
+  });
+
+  socket.on('disconnect', async () => {
+    console.log('Client disconnected:', socket.id);
+    try {
+      const keys = await redis.keys('user:*:socket');
+      for (const key of keys) {
+        const socketVal = await redis.get(key);
+        if (socketVal === socket.id) {
+          const disconnectedUserId = key.match(/^user:(.+):socket$/)?.[1];
+          await redis.del(key);
+          if (disconnectedUserId) {
+            await cleanupManagedBotRoomForUser(io, disconnectedUserId);
+          }
+          console.log(`[socket] Removed stale socket key ${key}`);
+        }
+      }
+    } catch (error) {
+      console.error('Redis Cleanup Error:', error);
+    }
+  });
+});
+
+async function listen(serverToStart, port) {
+  if (serverToStart.listening) return serverToStart;
+
+  await new Promise((resolve, reject) => {
+    const onError = (error) => {
+      serverToStart.off('listening', onListening);
+      reject(error);
+    };
+    const onListening = () => {
+      serverToStart.off('error', onError);
+      resolve();
+    };
+
+    serverToStart.once('error', onError);
+    serverToStart.once('listening', onListening);
+    serverToStart.listen(port);
+  });
+
+  return serverToStart;
+}
+
+async function startApp(options = {}) {
+  if (started) return { app, server, io, bot: botInstance };
+  started = true;
+
+  const {
+    port = PORT,
+    startTelegramBot = process.env.START_TELEGRAM_BOT !== 'false',
+  } = options;
+
   try {
     await testConnection();
     await ensureAppSchema();
+    await startAdminChangeListener(io);
     console.log('Postgres schema ready');
 
-    // Connect Redis
     await connectRedis();
 
-    // Create HTTP server & Socket.IO
-    const server = http.createServer(app);
-    const io = new Server(server, {
-      cors: {
-        origin: "*",
-        methods: ["GET", "POST"]
-      }
-    });
-app.set('io', io);
-    // Handle Socket.IO connections
-    io.on("connection", (socket) => {
-      console.log("⚡ New client connected:", socket.id);
-
-      // Listen for user identification from the frontend
-      socket.on("auth_user", async (telegramId) => {
-        if (!telegramId) return;
-        
-        try {
-          // Store socketId in Redis using telegramId as the key
-          await redis.set(`user:${telegramId}:socket`, socket.id);
-          await ensureManagedBotRoomForUser(io, telegramId);
-          console.log(`✅ Saved to Redis: User ${telegramId} -> Socket ${socket.id}`);
-
-          // Fetch and display current Redis data in the console
-          const keys = await redis.keys('user:*:socket');
-          console.log("\n--- 📊 Current Redis DB Data ---");
-          for (const key of keys) {
-            const socketVal = await redis.get(key);
-            console.log(`🔑 ${key}  =>  🔌 ${socketVal}`);
-          }
-          console.log("--------------------------------\n");
-        } catch (error) {
-          console.error("Redis Error:", error);
-        }
-      });
-
-      socket.on("call_player", async (payload = {}) => {
-        try {
-          const roomId = String(payload.roomId || "").trim();
-          const fromUserId = String(payload.fromUserId || "").trim();
-          const targetUserId = String(payload.targetUserId || "").trim();
-          if (!roomId || !fromUserId || !targetUserId) return;
-
-          const rawRoomState = await redis.get(`room:${roomId}`);
-          if (!rawRoomState) return;
-          const roomState = JSON.parse(rawRoomState);
-          const players = roomState.players || [];
-          const fromPlayer = players.find((player) => String(player.telegramId) === fromUserId);
-          const targetPlayer = players.find((player) => String(player.telegramId) === targetUserId);
-          if (!fromPlayer || !targetPlayer) return;
-
-          const callPayload = {
-            roomId,
-            fromUserId,
-            targetUserId,
-            at: new Date().toISOString(),
-            nonce: `${Date.now()}-${Math.random()}`,
-          };
-          roomState.lastCall = callPayload;
-          await redis.set(`room:${roomId}`, JSON.stringify(roomState));
-
-          if (targetPlayer.socketId) {
-            io.to(targetPlayer.socketId).emit("player_call", callPayload);
-          }
-        } catch (error) {
-          console.error("Player call relay error:", error);
-        }
-      });
-
-      // Handle Disconnect & Cleanup Redis
-      socket.on("disconnect", async () => {
-        console.log("❌ Client disconnected:", socket.id);
-        try {
-          // Find and delete the Redis key associated with this socket ID
-          const keys = await redis.keys('user:*:socket');
-          for (const key of keys) {
-            const socketVal = await redis.get(key);
-            if (socketVal === socket.id) {
-              const disconnectedUserId = key.match(/^user:(.+):socket$/)?.[1];
-              await redis.del(key);
-              if (disconnectedUserId) {
-                await cleanupManagedBotRoomForUser(io, disconnectedUserId);
-              }
-              console.log(`🗑️ Removed ${key} from Redis on disconnect.`);
-            }
-          }
-        } catch (error) {
-          console.error("Redis Cleanup Error:", error);
-        }
-      });
-    });
-
-    // Send incrementing number to all clients every second
     let counter = 0;
-    setInterval(() => {
-      counter++;
-      io.emit("numberUpdate", { number: counter });
+    counterInterval = setInterval(() => {
+      counter += 1;
+      io.emit('numberUpdate', { number: counter });
     }, 1000);
 
-    deleteIdleRooms(io);
-    setInterval(() => deleteIdleRooms(io), ROOM_CLEANUP_INTERVAL_MS);
-    setInterval(() => reconcileConnectedUsers(io), BOT_ROOM_RECONCILE_INTERVAL_MS);
+    await deleteIdleRooms(io);
+    cleanupInterval = setInterval(() => deleteIdleRooms(io), ROOM_CLEANUP_INTERVAL_MS);
+    botReconcileInterval = setInterval(() => reconcileConnectedUsers(io), BOT_ROOM_RECONCILE_INTERVAL_MS);
+    await reconcileExpiredRematches(io);
+    rematchReconcileInterval = setInterval(
+      () => reconcileExpiredRematches(io),
+      REMATCH_RECONCILE_INTERVAL_MS
+    );
 
-    // Start server
-    server.listen(PORT, () => {
-      console.log(`🌐 Backend + Socket.IO listening on port ${PORT}`);
-    });
+    await listen(server, port);
+    console.log(`Backend + Socket.IO listening on port ${port}`);
 
-    // Start Telegram bot
-    const bot = createBot();
-    await startBot(bot);
+    await startBroadcastWorker();
 
-    process.once('SIGINT', () => bot.stop('SIGINT'));
-    process.once('SIGTERM', () => bot.stop('SIGTERM'));
-    console.log('🤖 Bot started');
+    if (startTelegramBot) {
+      botInstance = createBot();
+      await startBot(botInstance);
+      process.once('SIGINT', () => botInstance?.stop('SIGINT'));
+      process.once('SIGTERM', () => botInstance?.stop('SIGTERM'));
+    }
 
+    return { app, server, io, bot: botInstance };
   } catch (err) {
-    console.error('❌ Application startup error:', err);
-    process.exit(1);
+    started = false;
+    await stopBroadcastWorker().catch(() => {});
+    await stopAdminChangeListener().catch(() => {});
+    if (counterInterval) clearInterval(counterInterval);
+    if (cleanupInterval) clearInterval(cleanupInterval);
+    if (botReconcileInterval) clearInterval(botReconcileInterval);
+    if (rematchReconcileInterval) clearInterval(rematchReconcileInterval);
+    counterInterval = null;
+    cleanupInterval = null;
+    botReconcileInterval = null;
+    rematchReconcileInterval = null;
+    throw err;
   }
 }
 
-startApp();
+async function stopApp() {
+  await stopBroadcastWorker();
+  await stopAdminChangeListener();
+  if (counterInterval) clearInterval(counterInterval);
+  if (cleanupInterval) clearInterval(cleanupInterval);
+  if (botReconcileInterval) clearInterval(botReconcileInterval);
+  if (rematchReconcileInterval) clearInterval(rematchReconcileInterval);
+  counterInterval = null;
+  cleanupInterval = null;
+  botReconcileInterval = null;
+  rematchReconcileInterval = null;
+
+  if (botInstance) {
+    botInstance.stop('shutdown');
+    botInstance = null;
+  }
+
+  if (server.listening) {
+    await new Promise((resolve, reject) => {
+      server.close((error) => (error ? reject(error) : resolve()));
+    });
+  }
+
+  started = false;
+}
+
+if (require.main === module) {
+  startApp().catch((err) => {
+    console.error('Application startup error:', err);
+    process.exit(1);
+  });
+}
+
+module.exports = {
+  app,
+  server,
+  io,
+  startApp,
+  stopApp,
+  deleteIdleRooms,
+  deleteRoomEverywhere,
+  shouldDeleteIdleRoom,
+};

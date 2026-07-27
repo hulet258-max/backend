@@ -1,10 +1,8 @@
 const express = require("express");
 const { redis } = require("../config/redis");
 const {
-  COIN_BIRR_VALUE,
   MIN_DEPOSIT_BIRR,
-  MIN_DEPOSIT_COINS,
-  birrToCoins,
+  birrToBalance,
 } = require("../config/economy");
 const { verifyPayment } = require("./receiptService");
 const { saveDepositTransaction, transactionExists } = require("../db/store");
@@ -108,8 +106,8 @@ async function isTransactionUsed(transactionId) {
   return transactionExists(transactionId);
 }
 
-async function saveTransaction(transactionId, userId, coinAmount) {
-  await saveDepositTransaction(transactionId, userId, coinAmount);
+async function saveTransaction(transactionId, userId, birrAmount) {
+  await saveDepositTransaction(transactionId, userId, birrAmount);
 }
 
 router.post("/check-receipt-demo", async (req, res) => {
@@ -189,11 +187,9 @@ router.post("/check-receipt-demo", async (req, res) => {
       });
     }
 
-    const creditedCoins = birrToCoins(paidBirr);
-    const creditedBirrValue = creditedCoins * COIN_BIRR_VALUE;
-    const roundedDownBirr = Number(Math.max(paidBirr - creditedBirrValue, 0).toFixed(2));
+    const creditedBirr = birrToBalance(paidBirr);
 
-    await saveTransaction(transactionId, telegramId, creditedCoins);
+    await saveTransaction(transactionId, telegramId, creditedBirr);
 
     return res.json({
       success: true,
@@ -201,13 +197,12 @@ router.post("/check-receipt-demo", async (req, res) => {
       message: serviceResponse?.message || "Receipt verified successfully.",
       serviceResponse,
       transactionId,
-      creditedAmount: creditedCoins,
-      creditedCoins,
+      creditedAmount: creditedBirr,
+      creditedBirr,
       paidBirr,
-      coinBirrValue: COIN_BIRR_VALUE,
-      creditedBirrValue,
-      roundedDownBirr,
-      conversionMode: "floor",
+      creditedBirrValue: creditedBirr,
+      roundedDownBirr: 0,
+      conversionMode: "birr-native",
       telegramId,
       submittedAt: new Date().toISOString(),
     });
