@@ -94,7 +94,7 @@ test("a user with six games across three days can withdraw", async () => {
   const result = await withdrawBalance("user-1", 10, "+251911111111");
 
   assert.equal(result.nextBalance, 90);
-  assert.equal(result.nextMaxWithdraw, 70);
+  assert.equal(result.nextMaxWithdraw, 40);
   assert.equal(calls.some(({ sql }) => sql.startsWith("UPDATE users")), true);
   assert.equal(calls.some(({ sql }) => sql === "COMMIT"), true);
   const eligibilityQuery = calls.find(({ sql }) => sql.includes("FROM users"));
@@ -131,8 +131,8 @@ test("a withdrawal that leaves exactly twenty Birr succeeds", async () => {
   assert.equal(calls.some(({ sql }) => sql === "COMMIT"), true);
 });
 
-test("multiple withdrawals totaling exactly two hundred Birr in an Ethiopian day succeed", async () => {
-  selectRows = [eligibleUser({ balance: "300" })];
+test("a player with 101 games can reach the 200 Birr daily limit", async () => {
+  selectRows = [eligibleUser({ balance: "300", games_played: "101" })];
   dailyWithdrawalRows = [{ withdrawn_today: "150" }];
 
   const result = await withdrawBalance("user-1", 50, "+251911111111");
@@ -145,15 +145,15 @@ test("multiple withdrawals totaling exactly two hundred Birr in an Ethiopian day
   assert.match(dailyQuery.sql, /date_trunc\('day'/);
 });
 
-test("a withdrawal that would exceed the daily two hundred Birr limit rolls back", async () => {
-  selectRows = [eligibleUser({ balance: "300" })];
-  dailyWithdrawalRows = [{ withdrawn_today: "150" }];
+test("a withdrawal that would exceed the player's daily tier limit rolls back", async () => {
+  selectRows = [eligibleUser({ balance: "100" })];
+  dailyWithdrawalRows = [{ withdrawn_today: "40" }];
 
   await assert.rejects(
-    withdrawBalance("user-1", 51, "+251911111111"),
+    withdrawBalance("user-1", 11, "+251911111111"),
     (error) => {
       assert.equal(error.message, "WITHDRAWAL_DAILY_LIMIT_EXCEEDED");
-      assert.equal(error.dailyLimit, 200);
+      assert.equal(error.dailyLimit, 50);
       return true;
     }
   );
@@ -161,6 +161,17 @@ test("a withdrawal that would exceed the daily two hundred Birr limit rolls back
   assert.equal(calls.some(({ sql }) => sql.startsWith("UPDATE users")), false);
   assert.equal(calls.some(({ sql }) => sql.includes("INSERT INTO withdrawal_requests")), false);
   assert.equal(calls.some(({ sql }) => sql === "ROLLBACK"), true);
+});
+
+test("a player above 300 games has no daily withdrawal cap", async () => {
+  selectRows = [eligibleUser({ balance: "1000", games_played: "301" })];
+
+  const result = await withdrawBalance("user-1", 600, "+251911111111");
+
+  assert.equal(result.dailyLimit, null);
+  assert.equal(result.remainingDailyLimit, null);
+  assert.equal(calls.some(({ sql }) => sql.includes("AS withdrawn_today")), false);
+  assert.equal(calls.some(({ sql }) => sql === "COMMIT"), true);
 });
 
 test("a withdrawal that leaves less than twenty Birr rolls back", async () => {

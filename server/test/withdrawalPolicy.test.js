@@ -2,7 +2,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 
 const {
-  DAILY_WITHDRAWAL_LIMIT_BIRR,
+  getDailyWithdrawalLimitBirr,
   MIN_WITHDRAW_BIRR,
   MIN_REMAINING_BALANCE_BIRR,
   MIN_WITHDRAWAL_GAMES,
@@ -19,6 +19,12 @@ test("withdrawals start at ten Birr and must leave twenty Birr in the account", 
   assert.equal(MIN_REMAINING_BALANCE_BIRR, 20);
 });
 
-test("withdrawals are capped at two hundred Birr per Ethiopian calendar day", () => {
-  assert.equal(DAILY_WITHDRAWAL_LIMIT_BIRR, 200);
+test("daily withdrawal limits increase with completed games", () => {
+  assert.equal(getDailyWithdrawalLimitBirr(0), 50);
+  assert.equal(getDailyWithdrawalLimitBirr(100), 50);
+  assert.equal(getDailyWithdrawalLimitBirr(101), 200);
+  assert.equal(getDailyWithdrawalLimitBirr(199), 200);
+  assert.equal(getDailyWithdrawalLimitBirr(200), 500);
+  assert.equal(getDailyWithdrawalLimitBirr(300), 500);
+  assert.equal(getDailyWithdrawalLimitBirr(301), null);
 });

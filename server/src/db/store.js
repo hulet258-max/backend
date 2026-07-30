@@ -1,7 +1,7 @@
 const { randomUUID } = require("crypto");
 const { pool, query } = require("../config/postgres");
 const {
-  DAILY_WITHDRAWAL_LIMIT_BIRR,
+  getDailyWithdrawalLimitBirr,
   MIN_COMMISSION_BIRR,
   MIN_REMAINING_BALANCE_BIRR,
   MIN_WITHDRAWAL_GAMES,
@@ -656,13 +656,19 @@ async function getUserProfile(userId) {
   const shareCount = Number(row.share_count || 0);
   const rewardCount = Number(row.reward_count || 0);
   const maxRewards = Number(row.max_rewards || 0);
+  const gamesPlayed = Number(statsResult.rows[0]?.games_played || 0);
+  const dailyWithdrawalLimit = getDailyWithdrawalLimitBirr(gamesPlayed);
 
   return {
     user,
     gameStats: {
-      gamesPlayed: Number(statsResult.rows[0]?.games_played || 0),
+      gamesPlayed,
       wins: Number(statsResult.rows[0]?.wins || 0),
       amountPlayed: parseNumber(statsResult.rows[0]?.amount_played || 0),
+    },
+    withdrawalPolicy: {
+      dailyLimitBirr: dailyWithdrawalLimit,
+      unlimited: dailyWithdrawalLimit === null,
     },
     referralStats: {
       shareCount,
@@ -1915,20 +1921,26 @@ async function withdrawBalance(userId, amount, phone, options = {}) {
       throw error;
     }
 
-    const dailyWithdrawalResult = await client.query(
-      `SELECT COALESCE(SUM(amount), 0) AS withdrawn_today
-      FROM withdrawal_requests
-      WHERE user_id = $1
-        AND requested_at >= (
-          date_trunc('day', NOW() AT TIME ZONE 'Africa/Addis_Ababa')
-          AT TIME ZONE 'Africa/Addis_Ababa'
-        )`,
-      [String(userId)]
-    );
-    const withdrawnToday = roundMoney(dailyWithdrawalResult.rows[0]?.withdrawn_today);
-    if (roundMoney(withdrawnToday + birrAmount) > DAILY_WITHDRAWAL_LIMIT_BIRR) {
+    const dailyLimit = getDailyWithdrawalLimitBirr(gamesPlayed);
+    let withdrawnToday = 0;
+    if (dailyLimit !== null) {
+      const dailyWithdrawalResult = await client.query(
+        `SELECT COALESCE(SUM(amount), 0) AS withdrawn_today
+        FROM withdrawal_requests
+        WHERE user_id = $1
+          AND requested_at >= (
+            date_trunc('day', NOW() AT TIME ZONE 'Africa/Addis_Ababa')
+            AT TIME ZONE 'Africa/Addis_Ababa'
+          )`,
+        [String(userId)]
+      );
+      withdrawnToday = roundMoney(dailyWithdrawalResult.rows[0]?.withdrawn_today);
+    }
+    if (dailyLimit !== null && roundMoney(withdrawnToday + birrAmount) > dailyLimit) {
       const error = new Error("WITHDRAWAL_DAILY_LIMIT_EXCEEDED");
-      error.dailyLimit = DAILY_WITHDRAWAL_LIMIT_BIRR;
+      error.dailyLimit = dailyLimit;
+      error.withdrawnToday = withdrawnToday;
+      error.remainingDailyLimit = Math.max(0, roundMoney(dailyLimit - withdrawnToday));
       throw error;
     }
 
@@ -2003,11 +2015,17 @@ async function withdrawBalance(userId, amount, phone, options = {}) {
         0,
         Math.min(
           Math.max(nextBalance - user.nonWithdrawableBalance, 0),
-          nextBalance - MIN_REMAINING_BALANCE_BIRR
+          nextBalance - MIN_REMAINING_BALANCE_BIRR,
+          dailyLimit === null ? Infinity : Math.max(0, dailyLimit - withdrawnToday - birrAmount)
         )
       ),
       gamesPlayed,
       playDays,
+      dailyLimit,
+      withdrawnToday: roundMoney(withdrawnToday + birrAmount),
+      remainingDailyLimit: dailyLimit === null
+        ? null
+        : Math.max(0, roundMoney(dailyLimit - withdrawnToday - birrAmount)),
       phone: normalizedPhone,
     };
   } catch (error) {

@@ -1,6 +1,5 @@
 const express = require("express");
 const {
-  DAILY_WITHDRAWAL_LIMIT_BIRR,
   MIN_REMAINING_BALANCE_BIRR,
   MIN_WITHDRAW_BIRR,
   MIN_WITHDRAWAL_GAMES,
@@ -88,6 +87,9 @@ router.post("/withdraw", async (req, res) => {
       limits: {
         minWithdraw: MIN_WITHDRAW_BIRR,
         maxWithdraw: result.nextMaxWithdraw,
+        dailyLimit: result.dailyLimit,
+        remainingDailyLimit: result.remainingDailyLimit,
+        unlimitedDailyWithdrawals: result.dailyLimit === null,
         gamesRequired: MIN_WITHDRAWAL_GAMES,
         playDaysRequired: MIN_WITHDRAWAL_PLAY_DAYS,
         minimumRemainingBalance: MIN_REMAINING_BALANCE_BIRR,
@@ -152,8 +154,11 @@ router.post("/withdraw", async (req, res) => {
     if (error.message === "WITHDRAWAL_DAILY_LIMIT_EXCEEDED") {
       return res.status(400).json({
         success: false,
-        error: `You can only withdraw up to ${DAILY_WITHDRAWAL_LIMIT_BIRR} Birr per day.`,
+        error: `Your current daily withdrawal limit is ${error.dailyLimit} Birr.`,
         code: "WITHDRAWAL_DAILY_LIMIT_EXCEEDED",
+        dailyLimit: error.dailyLimit,
+        withdrawnToday: error.withdrawnToday,
+        remainingDailyLimit: error.remainingDailyLimit,
       });
     }
 
