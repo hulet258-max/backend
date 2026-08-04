@@ -112,19 +112,12 @@ async function saveTransaction(transactionId, userId, birrAmount) {
 
 router.post("/check-receipt-demo", async (req, res) => {
   try {
-    const { receiptTextOrLink, confirmedByUser, expectedAmount, socketId, userId } = req.body;
+    const { receiptTextOrLink, expectedAmount, socketId, userId } = req.body;
 
     if (!receiptTextOrLink || !String(receiptTextOrLink).trim()) {
       return res.status(400).json({
         success: false,
         error: "receiptTextOrLink is required.",
-      });
-    }
-
-    if (!confirmedByUser) {
-      return res.status(400).json({
-        success: false,
-        error: "Please confirm payment before submitting.",
       });
     }
 
